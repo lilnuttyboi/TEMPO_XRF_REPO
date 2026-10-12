@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Sequence
 import sys
 import numpy as np
 import plotly.graph_objects as go
@@ -488,6 +488,7 @@ class RoboAiXrfSimulation(BaseModel):
         beam_on: int,
         number_of_thread: int,
         show_progress_terminal: bool = False,
+        cluster_nodes: int | str | Sequence[str] = 1,
     ) -> subprocess.Popen:
         
         self._run_done.clear()
@@ -497,6 +498,9 @@ class RoboAiXrfSimulation(BaseModel):
             raise RuntimeError(
                 "Call simulation.compile() first."
             )
+        workers = int(number_of_thread)
+        if not 1 <= workers <= 80:
+            raise ValueError("number_of_thread must be between 1 and 80 on the cluster.")
 
         print_display = max(
             1,
@@ -505,7 +509,7 @@ class RoboAiXrfSimulation(BaseModel):
 
         _, macro_file_path = self.write_macro(
             beam_on=beam_on,
-            number_of_thread=number_of_thread,
+            number_of_thread=workers,
             print_display=print_display,
         )
 
@@ -517,8 +521,49 @@ class RoboAiXrfSimulation(BaseModel):
             self.config_path / "simulation.root"
         )
 
-        self._beam_on = 0
+        repo_candidates = []
+        configured_repo = os.environ.get("TEMPO_XRF_REPO")
+        if configured_repo:
+            repo_candidates.append(Path(configured_repo).expanduser().resolve())
+        repo_candidates.append(self.ROOTPATH.parent.resolve())
+        repo_candidates.extend(self.config_path.resolve().parents)
+        repo = next(
+            (
+                candidate
+                for candidate in repo_candidates
+                if (candidate / "cluster_jobs" / "ui_cluster_run.py").is_file()
+                and (candidate / "geant4_code" / "build" / "sim").is_file()
+            ),
+            None,
+        )
+        if repo is None:
+            raise FileNotFoundError(
+                "Could not locate the TEMPO XRF repository. Set TEMPO_XRF_REPO "
+                "to the checkout containing cluster_jobs and geant4_code/build/sim."
+            )
 
+        build_dir = repo / "geant4_code" / "build"
+        launch_command = [
+            sys.executable,
+            str(repo / "cluster_jobs" / "ui_cluster_run.py"),
+            str(self.config_path.resolve()),
+            str(int(beam_on)),
+            str(workers),
+        ]
+        if isinstance(cluster_nodes, int):
+            if cluster_nodes < 1:
+                raise ValueError("cluster_nodes must be at least 1.")
+            launch_command.extend(["--node-count", str(cluster_nodes)])
+        else:
+            if isinstance(cluster_nodes, str):
+                selected_nodes = cluster_nodes
+            else:
+                selected_nodes = ",".join(str(node) for node in cluster_nodes)
+            if not selected_nodes.strip():
+                raise ValueError("Select at least one cluster node.")
+            launch_command.extend(["--nodes", selected_nodes])
+
+        self._beam_on = 0
         if root_file.exists():
             root_file.unlink()
         bar = tqdm(
@@ -529,22 +574,11 @@ class RoboAiXrfSimulation(BaseModel):
         )
 
         process = subprocess.Popen(
-            [
-                "./sim",
-                str(config_file),
-                str(macro_file_path),
-            ],
-            cwd=(
-                self.ROOTPATH.parent
-                / "geant4_code"
-                / "build"
-            ),
+            launch_command,
+            cwd=build_dir,
             start_new_session=True,
-
-            # Capture Geant4 output so it does NOT spam terminal
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-
             text=True,
             bufsize=1,
         )

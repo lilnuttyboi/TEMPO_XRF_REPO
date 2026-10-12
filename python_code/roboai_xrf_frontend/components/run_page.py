@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 import time
 
 import streamlit as st
 import streamlit.components.v1 as components
 
 from builder import build_simulation
+
+REPO_PATH = Path(__file__).resolve().parents[3]
+if str(REPO_PATH) not in sys.path:
+    sys.path.append(str(REPO_PATH))
+
+from cluster_jobs.cluster_config import discover_nodes
 from components.common import page_header
 from state import (
     configuration_fingerprint,
@@ -27,6 +34,12 @@ def _simulation_is_current() -> bool:
             st.session_state.ui_config
         )
     )
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cluster_inventory() -> tuple[tuple[str, ...], str, str | None]:
+    inventory = discover_nodes()
+    return inventory.nodes, inventory.source, inventory.warning
 
 
 def _finalize_finished_process() -> None:
@@ -179,12 +192,17 @@ def render_run_page():
         )
 
         threads = c2.number_input(
-            "Threads",
+            "Workers per node",
             min_value=1,
+            max_value=80,
             value=int(
                 run["number_of_thread"]
             ),
             step=1,
+            help=(
+                "Use 40 for one worker per physical core or 80 to use both "
+                "hardware threads on each core. Benchmark both for throughput."
+            ),
         )
 
         c1, c2 = st.columns(2)
@@ -254,6 +272,41 @@ def render_run_page():
             st.success(
                 "Run settings saved."
             )
+
+    st.divider()
+
+    node_options, inventory_source, inventory_warning = _cluster_inventory()
+    execution_mode = st.radio(
+        "Cluster execution",
+        options=("Single node", "Distributed"),
+        horizontal=True,
+        key="cluster_execution_mode",
+    )
+    if execution_mode == "Single node":
+        selected_nodes = [
+            st.selectbox(
+                "Compute node",
+                options=node_options,
+                key="single_cluster_node",
+            )
+        ]
+    else:
+        selected_nodes = st.multiselect(
+            "Compute nodes",
+            options=node_options,
+            default=list(node_options),
+            key="distributed_cluster_nodes",
+            help=(
+                "One concurrent shard is assigned to each selected node. "
+                "The list is refreshed from Slurm, so newly added nodes appear here."
+            ),
+        )
+    st.caption(
+        f"Node inventory: {inventory_source}. "
+        f"Workers per selected node: {int(run['number_of_thread'])}."
+    )
+    if inventory_warning:
+        st.caption(inventory_warning)
 
     st.divider()
 
@@ -436,11 +489,15 @@ def render_run_page():
                 run["beam_on"]
             )
 
+            if not selected_nodes:
+                raise ValueError("Select at least one compute node.")
+
             process = sim.start_run(
                 beam_on=selected_beam_on,
                 number_of_thread=int(
                     run["number_of_thread"]
                 ),
+                cluster_nodes=selected_nodes,
             )
             st.session_state.geant4_started_at = time.time()
 
