@@ -256,8 +256,19 @@ closes the original eight-node execution and Xerces failure reproduction loop.
   explanation for the small regression. The UI/tqdm rate of 5,477,872.86
   events/s was a smoothed progress rate, not final wall throughput: even before
   queue and merge overhead, the slowest node bounds aggregate completion at
-  about 5,103,395 events/s. Benchmark one, two, and four chunks at production
-  scale rather than using the progress-rate peak as the result.
+  about 5,103,395 events/s. This motivated a controlled production-scale matrix
+  instead of using the progress-rate peak as the result.
+- The production matrix subsequently completed with 500 million events per run
+  on the same 20 nodes. It measured 70 and 80 workers with 1, 2, and 4 chunks per
+  node. **80 workers with one chunk per node won at 5,119,920.84 events/s end to
+  end.** At 80 workers, two chunks reached 4,707,859.15 events/s and four reached
+  4,348,161.68; one chunk was therefore 8.75% faster than two and 17.75% faster
+  than four. At one chunk, 80 workers was 9.22% faster than 70. Relative to the
+  old 70-worker/four-chunk setting measured in the same matrix, the winning
+  combination increased throughput by 27.80%. The production recommendation is
+  now 80 workers and one chunk per selected node for this configuration and node
+  set. The retained benchmark JSON is
+  `benchmarks/20261027_140740_chunks.json`; Automatic mode consumes it.
 - The first Automatic implementation used the short 100,000-event 40/80 worker
   benchmark as an absolute production throughput calibration. That benchmark
   was startup-dominated and would have capped a one-billion-event run at 32
@@ -372,6 +383,12 @@ gating, an end-to-end shard macro rewrite with a fake simulator, and execution
 of the controller from a simulated Slurm spool path.
 This laptop has no Slurm client, so the real array allocation was validated on
 management as recorded below.
+
+After deploying commit `6abc0ae` to `/srv/cluster/TEMPO_XRF_REPO`, all 23 tests
+also passed in the production management virtualenv on 2026-10-27. The job 805
+artifact directory occupied 326 MiB, and `/srv/cluster` had 46 GiB free on its
+70-GiB filesystem. The planned six-run, 500-million-event benchmark matrix is
+therefore expected to require roughly 1 GiB and has adequate free space.
 
 The current 17-test suite also passed under the Python 3.11 management venv from
 the clean NFS-visible checkout `/srv/cluster/TEMPO_XRF_QUEUE_TEST`. Both batch
@@ -658,8 +675,19 @@ alternating repetition only if the first-place margin is small or results are
 noisy. Check NFS free space first because every non-published benchmark still
 retains its shard and combined ROOT artifacts.
 
-Job 805 confirms representative 47.5-second chunks and about 262,832 events/s
+Job 805 confirmed representative 47.5-second chunks and about 262,832 events/s
 per node at 70 workers. Its node totals varied by only 1.15%, and all nodes ran
-exactly four chunks, so extra queue depth did not rebalance work. Start with a
-production-scale 1/2/4 comparison at 80 workers; add eight only if throughput is
-still increasing with four or real runs show materially greater node imbalance.
+exactly four chunks, so extra queue depth did not rebalance work. This evidence
+led to the production-scale worker/chunk matrix below.
+
+That comparison is now complete. Results in end-to-end events/s were:
+
+| Workers | 1 chunk/node | 2 chunks/node | 4 chunks/node |
+|---:|---:|---:|---:|
+| 70 | 4,687,623.83 | 4,493,892.23 | 4,006,266.53 |
+| 80 | **5,119,920.84** | 4,707,859.15 | 4,348,161.68 |
+
+Use **80 workers and one chunk per selected node** for this full-XRF workload on
+the current 20-node set. Retain additional chunks as a manual option for a future
+heterogeneous cluster, transiently unreliable nodes, or a materially different
+configuration whose own benchmark demonstrates a benefit.

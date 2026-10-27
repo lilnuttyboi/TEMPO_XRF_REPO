@@ -141,8 +141,9 @@ def main() -> None:
                     "job_id": manifest["job_id"],
                 }
             )
+            chunk_label = "chunk" if chunks_per_node == 1 else "chunks"
             print(
-                f"{workers} workers, {chunks_per_node} chunks/node: "
+                f"{workers} workers, {chunks_per_node} {chunk_label}/node: "
                 f"{elapsed_seconds:.3f} s, "
                 f"{args.events / elapsed_seconds:,.2f} events/s end to end"
             )
@@ -203,13 +204,14 @@ def main() -> None:
     print("Median end-to-end throughput:")
     for workers in worker_counts:
         for chunks_per_node in chunk_counts:
+            chunk_label = "chunk" if chunks_per_node == 1 else "chunks"
             print(
-                f"  {workers} workers, {chunks_per_node} chunks/node: "
+                f"  {workers} workers, {chunks_per_node} {chunk_label}/node: "
                 f"{medians[(workers, chunks_per_node)]:,.2f} events/s"
             )
     print(
         f"Measured recommendation: {winner[0]} workers and "
-        f"{winner[1]} chunks per selected node"
+        f"{winner[1]} {'chunk' if winner[1] == 1 else 'chunks'} per selected node"
     )
     print(f"Benchmark JSON: {output}")
 

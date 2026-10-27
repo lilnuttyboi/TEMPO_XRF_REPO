@@ -660,6 +660,21 @@ than adding more chunks. A controlled 70/80-worker, 1/2/4-chunk matrix is the
 next measurement. The UI progress meter's reported peak or smoothed event rate
 is not final wall throughput; use benchmark elapsed time and manifest timings.
 
+The follow-up matrix ran 500 million events for every combination of 70/80
+workers and 1/2/4 chunks per node. End-to-end results were:
+
+| Workers | 1 chunk/node | 2 chunks/node | 4 chunks/node |
+|---:|---:|---:|---:|
+| 70 | 4,687,623.83 | 4,493,892.23 | 4,006,266.53 |
+| 80 | **5,119,920.84** | 4,707,859.15 | 4,348,161.68 |
+
+The verified production recommendation is **80 workers and one chunk per
+selected node**. One chunk at 80 workers was 8.75% faster than two chunks, 17.75%
+faster than four chunks, and 27.80% faster than the old 70-worker/four-chunk
+combination within the same matrix. Automatic mode loads the retained result
+from `benchmarks/20261027_140740_chunks.json` when the configuration, node set,
+worker count, and workload scale match.
+
 ## Starting the frontend
 
 Start only from the shared production checkout:
