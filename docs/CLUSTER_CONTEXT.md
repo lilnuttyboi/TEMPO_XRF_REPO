@@ -20,9 +20,12 @@ The quantitative-run path is:
    frontend run and submits `cluster_jobs/run_cluster.sbatch` as a throttled Slurm
    job array. Distributed UI runs automatically recommend chunks per selected
    node from the saved event total, selected-node count, worker count, and
-   representative timing from matching completed runs. A conservative fallback
-   is used until such a run exists; Automatic is capped at eight chunks per node,
-   while a 1--32 manual override remains available. The array
+   representative timing from matching completed runs. A completed queue-depth
+   benchmark for the same configuration, workers, selected nodes, and comparable
+   event scale (within 2x) takes precedence and supplies its measured winner
+   directly. A conservative fallback
+   is used until such evidence exists; heuristic Automatic is capped at eight
+   chunks per node, while a 1--32 manual override remains available. The array
    concurrency limit equals the selected-node count. Each array element requests
    one exclusive node, so a node that finishes can receive the next pending chunk
    instead of waiting for the slowest original assignment.
@@ -241,12 +244,20 @@ closes the original eight-node execution and Xerces failure reproduction loop.
   clean side-by-side checkout and the selectively merged production checkout.
   Restarting the production UI and submitting one small UI-driven queue run are
   the remaining operational checks.
-- A user-reported one-billion-event production run completed at approximately
-  5,477,872.86 events/s end to end (briefly about 6 million events/s), or roughly
-  183 seconds. It used a UI value of four chunks and was reported slightly slower
-  than the pre-queue implementation. The exact manifest, selected node count,
-  per-chunk times, and node distribution are still awaiting inspection. Do not
-  declare four optimal until the 1/2/4/8 benchmark is run.
+- Production Slurm job 805 completed one billion events using all 20 nodes,
+  **70** workers per node, four chunks per node, 80 total chunks, and concurrency
+  20. Every node processed exactly four chunks and 50 million events; faster
+  nodes did not take a fifth chunk. Per-chunk time was 45.970--49.659 seconds
+  (median 47.523), with median effective per-node throughput 263,029.97 events/s.
+  Summed node time was 3,804.717 seconds, or 262,831.62 events/s per node. Node
+  four-chunk totals were 186.889--195.948 seconds with only 1.15% coefficient of
+  variation. This cluster was too uniform for four-chunk dynamic redistribution
+  to help this run; repeated initialization and merging are now the leading
+  explanation for the small regression. The UI/tqdm rate of 5,477,872.86
+  events/s was a smoothed progress rate, not final wall throughput: even before
+  queue and merge overhead, the slowest node bounds aggregate completion at
+  about 5,103,395 events/s. Benchmark one, two, and four chunks at production
+  scale rather than using the progress-rate peak as the result.
 - The first Automatic implementation used the short 100,000-event 40/80 worker
   benchmark as an absolute production throughput calibration. That benchmark
   was startup-dominated and would have capped a one-billion-event run at 32
@@ -301,6 +312,11 @@ tests/test_cluster_jobs.py -v`.
   `%selected_nodes` throttling, so at most one full-node chunk runs per selected
   node at once and newly free nodes take pending chunks. Single-node UI runs use
   one chunk by default.
+- A `benchmarks/*_chunks.json` result with the same `config.json` hash, exact
+  selected-node set, worker count, and event total within a factor of two
+  overrides the duration heuristic with its measured queue winner. Changing the
+  configuration, nodes, workers, or workload scale safely falls back to learned
+  representative timing or the conservative default.
 - Queue calculations use the saved Beam-on events value. The UI names and formats
   that total explicitly and instructs the user to click **Save run settings**
   after editing events or workers. The confusing preview of 80 chunks at 1,250
@@ -346,10 +362,11 @@ bash -n cluster_jobs/run_cluster.sbatch cluster_jobs/run_shard.sbatch
 git diff --check
 ```
 
-All 22 unit/integration tests passed. The tests cover eight-node fallback and
+All 23 unit/integration tests passed. The tests cover eight-node fallback and
 future-node override discovery, exact event division, adaptive-throughput chunk
-recommendations and bounds, representative-history filtering, benchmark-list
-validation, independent seeds, 40/80 CPU and memory flags, throttled job-array
+recommendations and bounds, representative-history filtering, measured-winner
+matching by configuration/nodes/workers, benchmark-list validation, independent
+seeds, 40/80 CPU and memory flags, throttled job-array
 submission, repeated-node queue completion, per-node accounting, success-marker
 gating, an end-to-end shard macro rewrite with a fake simulator, and execution
 of the controller from a simulated Slurm spool path.
@@ -611,16 +628,17 @@ be characterised independently of initialization and ROOT-output overhead.
 
 ## Repeatable queue-depth benchmark
 
-`cluster_jobs/benchmark_chunks.py` compares 1, 2, 4, and 8 chunks per selected
-node on the same compiled configuration, nodes, workers, event count, and paired
-seed base. It measures end-to-end controller time, including Slurm waiting,
+`cluster_jobs/benchmark_chunks.py` compares a matrix of worker counts and chunk
+counts on the same compiled configuration, nodes, event count, and paired seed
+base. It measures end-to-end controller time, including Slurm waiting,
 Geant4, validation, and merging, because that is the throughput visible to the
 user. With two repetitions it reverses the order in the second pass to reduce
 temperature, cache, or cluster-drift bias. It never publishes over the current
 top-level result.
 
-For the production workload, first run one repetition at the normal one-billion
-event total while the selected nodes are otherwise idle:
+For the production workload, first compare the observed 70-worker setting with
+80 workers and 1/2/4 chunks using 500 million events. This keeps every tested
+chunk representative while reducing the initial six-run matrix cost:
 
 ```bash
 cd /srv/cluster/TEMPO_XRF_REPO
@@ -628,18 +646,20 @@ source .venv/bin/activate
 export PYTHONPATH=/srv/cluster/TEMPO_XRF_REPO
 python cluster_jobs/benchmark_chunks.py \
   python_code/roboai_xrf_frontend/runs/full_xrf_example \
-  --events 1000000000 --workers 80 --chunks 1,2,4,8 --repetitions 1
+  --events 500000000 --workers 70,80 --chunks 1,2,4 --repetitions 1
 ```
 
-This is expected to take roughly four production runs (about 12 minutes if the
-reported three-minute time remains stable). Use `--nodes` to reproduce an exact
-UI selection. The script writes every job ID, artifact path, node distribution,
-Geant4 node-seconds, end-to-end rate, medians, and the winner under
-`<config_dir>/benchmarks/*_chunks.json`. Run a second alternating repetition only
-if the first-place margin is small or results are noisy.
+Use `--nodes` to reproduce an exact UI selection. The script writes every job ID,
+artifact path, node distribution, Geant4 node-seconds, end-to-end rate, medians,
+the winner for each worker count, and the overall winning combination under
+`<config_dir>/benchmarks/*_chunks.json`. Automatic mode consumes the per-worker
+winner only when configuration, selected-node set, and event scale match. Run a second
+alternating repetition only if the first-place margin is small or results are
+noisy. Check NFS free space first because every non-published benchmark still
+retains its shard and combined ROOT artifacts.
 
-The user's reported 5,477,872.86 events/s is consistent with 182.6 seconds for
-one billion events. It is evidence that the old 100,000-event calibration cannot
-predict production chunk duration, but it is not yet enough to identify whether
-1, 2, 4, or 8 chunks per node maximizes throughput. Inspect the corresponding
-manifest and run this benchmark before changing the measured default.
+Job 805 confirms representative 47.5-second chunks and about 262,832 events/s
+per node at 70 workers. Its node totals varied by only 1.15%, and all nodes ran
+exactly four chunks, so extra queue depth did not rebalance work. Start with a
+production-scale 1/2/4 comparison at 80 workers; add eight only if throughput is
+still increasing with four or real runs show materially greater node imbalance.

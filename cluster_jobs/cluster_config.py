@@ -52,6 +52,17 @@ class ThroughputCalibration:
     source: str
 
 
+@dataclass(frozen=True)
+class QueueBenchmarkRecommendation:
+    workers: int
+    chunks_per_node: int
+    selected_nodes: tuple[str, ...]
+    events_per_run: int
+    repetitions: int
+    end_to_end_events_per_second: float
+    source: str
+
+
 def _deduplicate(items: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(items))
 
@@ -258,6 +269,71 @@ def load_throughput_calibration(
         median_chunk_seconds=statistics.median(durations),
         source=f"{qualifying_runs} matching completed run(s)",
     )
+
+
+def load_queue_benchmark_recommendation(
+    config_dir: Path,
+    workers: int,
+    selected_nodes: Sequence[str],
+    total_events: int,
+) -> QueueBenchmarkRecommendation | None:
+    """Return a measured queue winner for a comparable workload and nodes."""
+    config_dir = Path(config_dir).resolve()
+    workers = validate_workers(workers)
+    nodes = parse_node_list(selected_nodes)
+    total_events = int(total_events)
+    if total_events < 1:
+        raise ValueError("Total events must be at least 1.")
+    current_config = config_dir / "config.json"
+    benchmark_dir = config_dir / "benchmarks"
+    if not current_config.is_file() or not benchmark_dir.is_dir():
+        return None
+    current_hash = _sha256(current_config)
+
+    paths = sorted(
+        benchmark_dir.glob("*_chunks.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for path in paths:
+        try:
+            result = json.loads(path.read_text(encoding="utf-8"))
+            if result.get("config_sha256") != current_hash:
+                continue
+            measured_nodes = parse_node_list(result["selected_nodes"])
+            if set(measured_nodes) != set(nodes):
+                continue
+            recommendation = result["recommended_chunks_per_node_by_worker"]
+            chunks_per_node = validate_chunks_per_node(recommendation[str(workers)])
+            if chunks_per_node > MAX_CHUNKS_PER_NODE:
+                raise ValueError("benchmark recommendation exceeds manual limit")
+            rates = result["median_end_to_end_events_per_second"]
+            rate = float(rates[f"w{workers}-c{chunks_per_node}"])
+            if not math.isfinite(rate) or rate <= 0:
+                raise ValueError("invalid benchmark throughput")
+            events_per_run = int(result["events_per_run"])
+            repetitions = int(result["repetitions"])
+            if events_per_run < 1 or repetitions < 1:
+                raise ValueError("invalid benchmark sample size")
+            event_scale_ratio = max(
+                total_events / events_per_run,
+                events_per_run / total_events,
+            )
+            if event_scale_ratio > 2:
+                continue
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            continue
+
+        return QueueBenchmarkRecommendation(
+            workers=workers,
+            chunks_per_node=chunks_per_node,
+            selected_nodes=measured_nodes,
+            events_per_run=events_per_run,
+            repetitions=repetitions,
+            end_to_end_events_per_second=rate,
+            source=str(path),
+        )
+    return None
 
 
 def recommend_chunks_per_node(

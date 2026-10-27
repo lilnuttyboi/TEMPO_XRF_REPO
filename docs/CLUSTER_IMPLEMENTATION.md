@@ -120,9 +120,12 @@ complete merge is published as the run's simulation.root
 The distributed implementation uses a Slurm job array instead of reserving every
 node in one gang allocation. Automatic queue sizing targets approximately 60
 seconds per chunk using representative timing learned from matching completed
-runs, and is capped at eight chunks per selected node. Until a matching long run
-exists it uses a conservative production-scale fallback. Manual mode allows
-1--32 chunks per selected node. Concurrent array elements are limited to the
+runs, and is capped at eight chunks per selected node. A measured queue benchmark
+for the same configuration, worker count, exact selected-node set, and event
+scale within a factor of two overrides that heuristic with its winning chunk
+count. Until matching evidence exists it uses a conservative production-scale
+fallback. Manual mode allows 1--32 chunks per selected node. Concurrent array
+elements are limited to the
 number of selected nodes. Each array element requests one exclusive node. When a
 fast node completes, Slurm can place another pending chunk there; a slower node
 naturally completes fewer chunks.
@@ -362,10 +365,12 @@ calculates median events per second, and saves every measurement to JSON.
 ### `cluster_jobs/benchmark_chunks.py`
 
 Production queue-depth benchmark. It runs the same total workload with a
-configurable list such as 1, 2, 4, and 8 chunks per selected node. It alternates
-order across repetitions, does not publish over the current result, measures
-end-to-end controller throughput including merge overhead, retains each run's
-job ID and node distribution, and saves the measured winner to JSON.
+configurable matrix such as 70/80 workers and 1/2/4 chunks per selected node. It
+alternates order across repetitions, does not publish over the current result,
+measures end-to-end controller throughput including merge overhead, retains each
+run's job ID and node distribution, and saves the per-worker and overall measured
+winners to JSON. The UI accepts a per-worker winner only when the configuration
+hash, exact selected-node set, and event total within a factor of two also match.
 
 ### `cluster_jobs/patch_ui.py`
 
@@ -398,9 +403,10 @@ The Build & run page now:
 - caches inventory for 30 seconds;
 - displays Single node and Distributed modes;
 - allows a configurable node selection instead of a fixed five-node checkbox;
-- defaults to **Automatic (recommended)** queue sizing, learns from matching
-  representative completed runs, caps Automatic at eight chunks per node, and
-  retains a 1--32 chunks-per-selected-node Manual override;
+- defaults to **Automatic (recommended)** queue sizing, uses an exact matching
+  queue benchmark when available, otherwise learns from matching representative
+  completed runs, caps heuristic Automatic at eight chunks per node, and retains
+  a 1--32 chunks-per-selected-node Manual override;
 - shows the saved event total, calculated chunks, event size, estimated chunk
   duration, and maximum concurrency;
 - defaults distributed selection to every discovered node;
@@ -580,8 +586,8 @@ failure verified the publication safety gate.
 The original 14 cluster tests passed on the laptop and in the management virtual
 environment. The dynamic queue raised this to 17 tests, which passed on
 management before and after selective production deployment. Adaptive queue
-sizing and the queue-depth benchmark bring the current local suite to 22; rerun
-those 22 on management after selectively deploying this update:
+sizing and the queue-depth benchmark bring the current local suite to 23; rerun
+those 23 on management after selectively deploying this update:
 
 ```bash
 cd /srv/cluster/TEMPO_XRF_REPO
@@ -641,6 +647,18 @@ long-run characterization, repeat the same benchmark with enough events for each
 timed simulation to run for several minutes. The result supports the relative
 80-versus-40 worker choice, but is no longer used as the absolute queue-sizing
 rate because startup dominated those short runs.
+
+### Production-scale queue observation
+
+Slurm job 805 completed one billion events on all 20 nodes with 70 workers and
+four chunks per node. All nodes processed exactly four chunks, and their total
+Geant4 times had only 1.15% coefficient of variation. Median chunk duration was
+47.523 seconds and event-weighted per-node throughput was 262,831.62 events/s.
+The dynamic queue therefore did not redistribute work in this run; reducing
+repeated initialization and merge inputs is a stronger optimization hypothesis
+than adding more chunks. A controlled 70/80-worker, 1/2/4-chunk matrix is the
+next measurement. The UI progress meter's reported peak or smoothed event rate
+is not final wall throughput; use benchmark elapsed time and manifest timings.
 
 ## Starting the frontend
 
@@ -835,9 +853,9 @@ python cluster_jobs/benchmark_workers.py \
 ```bash
 python cluster_jobs/benchmark_chunks.py \
   python_code/roboai_xrf_frontend/runs/full_xrf_example \
-  --events 1000000000 \
-  --workers 80 \
-  --chunks 1,2,4,8 \
+  --events 500000000 \
+  --workers 70,80 \
+  --chunks 1,2,4 \
   --repetitions 1
 ```
 

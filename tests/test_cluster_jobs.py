@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,7 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from cluster_jobs.benchmark_chunks import parse_chunk_counts
+from cluster_jobs.benchmark_chunks import parse_chunk_counts, parse_worker_counts
 from cluster_jobs.cluster_config import (
     DEFAULT_NODES,
     MEMORY_MIB_PER_NODE,
@@ -17,6 +18,7 @@ from cluster_jobs.cluster_config import (
     calculate_queue_shape,
     discover_nodes,
     estimate_node_throughput,
+    load_queue_benchmark_recommendation,
     load_throughput_calibration,
     parse_node_list,
     recommend_chunks_per_node,
@@ -31,8 +33,11 @@ from cluster_jobs.ui_cluster_run import run_cluster
 class ClusterConfigTests(unittest.TestCase):
     def test_chunk_benchmark_list_is_validated_and_deduplicated(self):
         self.assertEqual(parse_chunk_counts("1,2,4,2,8"), (1, 2, 4, 8))
+        self.assertEqual(parse_worker_counts("70,80,70"), (70, 80))
         with self.assertRaises(ValueError):
             parse_chunk_counts("0")
+        with self.assertRaises(ValueError):
+            parse_worker_counts("81")
 
     def test_documented_fallback_contains_all_eight_nodes(self):
         self.assertEqual(
@@ -168,6 +173,61 @@ class ClusterConfigTests(unittest.TestCase):
         self.assertEqual(calibration.run_count, 1)
         self.assertEqual(calibration.chunk_count, 2)
         self.assertEqual(calibration.median_chunk_seconds, 20.0)
+
+    def test_queue_benchmark_winner_requires_matching_config_and_nodes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config_dir = Path(temporary) / "compiled"
+            config_dir.mkdir()
+            config = config_dir / "config.json"
+            config.write_text('{"physics":"same"}\n')
+            benchmark_dir = config_dir / "benchmarks"
+            benchmark_dir.mkdir()
+            (benchmark_dir / "20261027_chunks.json").write_text(
+                json.dumps(
+                    {
+                        "config_sha256": hashlib.sha256(
+                            config.read_bytes()
+                        ).hexdigest(),
+                        "selected_nodes": ["node-01-001", "node-01-002"],
+                        "events_per_run": 500_000_000,
+                        "repetitions": 1,
+                        "recommended_chunks_per_node_by_worker": {
+                            "70": 2,
+                            "80": 1,
+                        },
+                        "median_end_to_end_events_per_second": {
+                            "w70-c2": 4_900_000.0,
+                            "w80-c1": 5_300_000.0,
+                        },
+                    }
+                )
+            )
+
+            recommendation = load_queue_benchmark_recommendation(
+                config_dir,
+                80,
+                ("node-01-002", "node-01-001"),
+                1_000_000_000,
+            )
+            wrong_nodes = load_queue_benchmark_recommendation(
+                config_dir,
+                80,
+                ("node-01-001",),
+                500_000_000,
+            )
+            wrong_scale = load_queue_benchmark_recommendation(
+                config_dir,
+                80,
+                ("node-01-001", "node-01-002"),
+                10_000_000,
+            )
+
+        self.assertIsNotNone(recommendation)
+        self.assertEqual(recommendation.chunks_per_node, 1)
+        self.assertEqual(recommendation.events_per_run, 500_000_000)
+        self.assertEqual(recommendation.end_to_end_events_per_second, 5_300_000.0)
+        self.assertIsNone(wrong_nodes)
+        self.assertIsNone(wrong_scale)
 
     def test_sbatch_uses_a_throttled_one_node_job_array(self):
         command = build_sbatch_command(

@@ -21,6 +21,7 @@ from cluster_jobs.cluster_config import (
     calculate_queue_shape,
     discover_nodes,
     estimate_node_throughput,
+    load_queue_benchmark_recommendation,
     load_throughput_calibration,
     recommend_chunks_per_node,
 )
@@ -54,6 +55,21 @@ def _cluster_inventory() -> tuple[tuple[str, ...], str, str | None]:
 @st.cache_data(ttl=30, show_spinner=False)
 def _calibrated_throughput(config_dir: str, workers: int):
     return load_throughput_calibration(Path(config_dir), workers)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _queue_benchmark(
+    config_dir: str,
+    workers: int,
+    nodes: tuple[str, ...],
+    total_events: int,
+):
+    return load_queue_benchmark_recommendation(
+        Path(config_dir),
+        workers,
+        nodes,
+        total_events,
+    )
 
 
 def _finalize_finished_process() -> None:
@@ -322,15 +338,29 @@ def render_run_page():
             if calibration is not None
             else estimate_node_throughput(int(run["number_of_thread"]))
         )
-        recommended_chunks = (
-            recommend_chunks_per_node(
-                int(run["beam_on"]),
-                len(selected_nodes),
+        benchmark_recommendation = (
+            _queue_benchmark(
+                str(expected_config_dir),
                 int(run["number_of_thread"]),
-                events_per_second=estimated_throughput,
+                tuple(selected_nodes),
+                int(run["beam_on"]),
             )
             if selected_nodes
-            else 1
+            else None
+        )
+        recommended_chunks = (
+            benchmark_recommendation.chunks_per_node
+            if benchmark_recommendation is not None
+            else (
+                recommend_chunks_per_node(
+                    int(run["beam_on"]),
+                    len(selected_nodes),
+                    int(run["number_of_thread"]),
+                    events_per_second=estimated_throughput,
+                )
+                if selected_nodes
+                else 1
+            )
         )
         queue_sizing_mode = st.radio(
             "Queue sizing",
@@ -340,19 +370,29 @@ def render_run_page():
         )
         if queue_sizing_mode == "Automatic (recommended)":
             chunks_per_node = recommended_chunks
-            st.caption(
-                f"Automatic recommendation: {chunks_per_node} chunk(s) per "
-                f"selected node. It targets about "
-                f"{RECOMMENDED_CHUNK_SECONDS:g} seconds per chunk and will not "
-                f"automatically exceed {MAX_AUTOMATIC_CHUNKS_PER_NODE}."
-            )
-            if calibration is not None:
+            if benchmark_recommendation is not None:
+                st.caption(
+                    f"Automatic recommendation: {recommended_chunks} chunk(s) per "
+                    f"selected node. This measured queue winner reached "
+                    f"{benchmark_recommendation.end_to_end_events_per_second:,.0f} "
+                    f"events/s end to end using the same configuration and "
+                    f"node selection."
+                )
+            else:
+                st.caption(
+                    f"Automatic recommendation: {chunks_per_node} chunk(s) per "
+                    f"selected node. It targets about "
+                    f"{RECOMMENDED_CHUNK_SECONDS:g} seconds per chunk and will "
+                    f"not automatically exceed "
+                    f"{MAX_AUTOMATIC_CHUNKS_PER_NODE}."
+                )
+            if benchmark_recommendation is None and calibration is not None:
                 st.caption(
                     f"Learned rate: {calibration.events_per_second:,.0f} "
                     f"events/s per node from {calibration.run_count} matching "
                     f"completed run(s), {calibration.chunk_count} chunks."
                 )
-            else:
+            elif benchmark_recommendation is None:
                 st.caption(
                     "No matching long-run timing is available yet; using a "
                     "conservative production-rate fallback. Manual remains "
