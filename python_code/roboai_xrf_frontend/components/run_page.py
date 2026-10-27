@@ -15,10 +15,7 @@ if str(REPO_PATH) not in sys.path:
     sys.path.append(str(REPO_PATH))
 
 from cluster_jobs.cluster_config import (
-    MAX_AUTOMATIC_CHUNKS_PER_NODE,
     MAX_CHUNKS_PER_NODE,
-    RECOMMENDED_CHUNK_SECONDS,
-    calculate_queue_shape,
     discover_nodes,
     estimate_node_throughput,
     load_queue_benchmark_recommendation,
@@ -292,7 +289,7 @@ def render_run_page():
 
     st.divider()
 
-    node_options, inventory_source, inventory_warning = _cluster_inventory()
+    node_options, _, inventory_warning = _cluster_inventory()
     execution_mode = st.radio(
         "Cluster execution",
         options=("Single node", "Distributed"),
@@ -370,34 +367,11 @@ def render_run_page():
         )
         if queue_sizing_mode == "Automatic (recommended)":
             chunks_per_node = recommended_chunks
-            if benchmark_recommendation is not None:
-                st.caption(
-                    f"Automatic recommendation: {recommended_chunks} chunk(s) per "
-                    f"selected node. This measured queue winner reached "
-                    f"{benchmark_recommendation.end_to_end_events_per_second:,.0f} "
-                    f"events/s end to end using the same configuration and "
-                    f"node selection."
-                )
-            else:
-                st.caption(
-                    f"Automatic recommendation: {chunks_per_node} chunk(s) per "
-                    f"selected node. It targets about "
-                    f"{RECOMMENDED_CHUNK_SECONDS:g} seconds per chunk and will "
-                    f"not automatically exceed "
-                    f"{MAX_AUTOMATIC_CHUNKS_PER_NODE}."
-                )
-            if benchmark_recommendation is None and calibration is not None:
-                st.caption(
-                    f"Learned rate: {calibration.events_per_second:,.0f} "
-                    f"events/s per node from {calibration.run_count} matching "
-                    f"completed run(s), {calibration.chunk_count} chunks."
-                )
-            elif benchmark_recommendation is None:
-                st.caption(
-                    "No matching long-run timing is available yet; using a "
-                    "conservative production-rate fallback. Manual remains "
-                    "available for a measured override."
-                )
+            chunk_label = "chunk" if recommended_chunks == 1 else "chunks"
+            st.caption(
+                f"Automatic recommendation: {recommended_chunks} {chunk_label} "
+                "per selected node."
+            )
         else:
             chunks_per_node = int(
                 st.number_input(
@@ -413,41 +387,6 @@ def render_run_page():
                         "Slurm and Geant4 startup overhead."
                     ),
                 )
-            )
-    st.caption(
-        f"Node inventory: {inventory_source}. "
-        f"Workers per selected node: {int(run['number_of_thread'])}."
-    )
-    if selected_nodes:
-        saved_events = int(run["beam_on"])
-        chunk_count, max_concurrent = calculate_queue_shape(
-            saved_events,
-            len(selected_nodes),
-            chunks_per_node,
-        )
-        smallest_chunk, extra = divmod(saved_events, chunk_count)
-        largest_chunk = smallest_chunk + (1 if extra else 0)
-        chunk_size = (
-            f"{smallest_chunk:,}"
-            if smallest_chunk == largest_chunk
-            else f"{smallest_chunk:,}-{largest_chunk:,}"
-        )
-        estimated_seconds = largest_chunk / estimated_throughput
-        st.caption(
-            f"Queue for the saved {saved_events:,}-event total: {chunk_count} "
-            f"chunks of about {chunk_size} events; up to {max_concurrent} run "
-            f"at once; estimated {estimated_seconds:.1f} seconds per chunk."
-        )
-        st.caption(
-            "After changing Beam-on events or Workers per node, click "
-            "Save run settings to update this recommendation. Actual duration "
-            "depends on the geometry and physics configuration."
-        )
-        if estimated_seconds < 10:
-            st.warning(
-                "Estimated chunks are under 10 seconds, so startup overhead may "
-                "be significant. For maximum efficiency, consider selecting "
-                "fewer nodes for this event total."
             )
     if inventory_warning:
         st.caption(inventory_warning)

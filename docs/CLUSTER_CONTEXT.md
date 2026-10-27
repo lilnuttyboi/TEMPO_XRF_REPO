@@ -329,10 +329,14 @@ tests/test_cluster_jobs.py -v`.
   configuration, nodes, workers, or workload scale safely falls back to learned
   representative timing or the conservative default.
 - Queue calculations use the saved Beam-on events value. The UI names and formats
-  that total explicitly and instructs the user to click **Save run settings**
-  after editing events or workers. The confusing preview of 80 chunks at 1,250
-  events came from the previously saved 100,000-event value; 10,000,000 events
-  with that same explicit queue shape would have produced 125,000-event chunks.
+  that total. The confusing preview of 80 chunks at 1,250 events came from the
+  previously saved 100,000-event value; 10,000,000 events with that same explicit
+  queue shape would have produced 125,000-event chunks. On 2026-10-27 the
+  inventory, queue-preview, timing, save-reminder, and verbose benchmark captions
+  were removed from the run page to keep the production UI compact. A single
+  concise line still shows the chosen automatic chunks per selected node.
+  Automatic sizing and measured benchmark selection are unchanged; their full
+  operational explanation remains here and in `CLUSTER_IMPLEMENTATION.md`.
 - For `N` chunks, chunk `i` receives
   `total // N + (i < total % N)` events. No zero-event shards are created.
 - Each shard receives a unique adjacent seed pair derived from a recorded seed
