@@ -18,8 +18,7 @@ and one chunk per selected node** fastest among the tested combinations on
 
 The underlying simulation comes from
 [TEMPO_XRF_REPO](https://github.com/Minmyatngwe/TEMPO_XRF_REPO/tree/front).
-Cluster work is maintained on `cluster-job-queue-2026-10-27` in the
-[fork](https://github.com/lilnuttyboi/TEMPO_XRF_REPO/tree/cluster-job-queue-2026-10-27).
+Cluster work is maintained on `cluster-job-queue-2026-10-27` in this fork.
 Management also contained independent application changes that we preserved.
 Not every C++ or frontend change originated in this cluster adaptation.
 
@@ -39,12 +38,12 @@ Not every C++ or frontend change originated in this cluster adaptation.
 - [Bottlenecks and future work](#bottlenecks-and-future-work)
 - [Accuracy and current limits](#accuracy-and-current-limits)
 
-This README is the branch's main operations and history guide.
-[CLUSTER_IMPLEMENTATION.md](docs/CLUSTER_IMPLEMENTATION.md) adds file-by-file
-detail; [CLUSTER_CONTEXT.md](docs/CLUSTER_CONTEXT.md) retains dated evidence and
-uncertainties for future work. Existing [simulation documentation](docs/index.md)
-covers the scientific application. `AGENTS.md` requires future cluster changes
-to consult and update the context.
+This README describes the implementation and benchmark methodology. Connection
+details, machine names, usernames, installation paths and raw operational logs
+belong in private site documentation, not this public guide. Command examples
+require locally supplied settings; they are not a ready-made site configuration.
+Existing [simulation documentation](docs/index.md) covers the scientific
+application. This README's redaction does not sanitize other files or Git history.
 
 ## What changed
 
@@ -70,35 +69,35 @@ its multithreaded master/worker model, described in
 
 ## Cluster and paths
 
-These are recorded installation facts, not a live inventory query:
+The benchmark hardware and required software roles are summarized below.
+Site-specific connection details and filesystem locations are deliberately omitted.
 
 | Item | Recorded value |
 |---|---|
-| Management/login host | `mnode@mnode-01`, private address `192.168.10.3` |
-| Laptop development checkout | `/home/nutty/Documents/TEMPO_XRF_REPO` |
-| Production checkout shared through NFS | `/srv/cluster/TEMPO_XRF_REPO` |
-| Clean queue-validation checkout | `/srv/cluster/TEMPO_XRF_QUEUE_TEST` |
-| Compute nodes | `node-01-[001-004]` through `node-05-[001-004]`: 20 nodes |
+| Management/login host | Site-specific; obtain from the administrator |
+| Development checkout | Local source checkout |
+| Production checkout shared through NFS | Set locally through `TEMPO_XRF_REPO` |
+| Clean queue-validation checkout | Separate shared test checkout |
+| Compute nodes | 20 in the benchmark; discover eligible names locally |
 | CPU topology/node | 2 sockets × 20 physical cores × 2 hardware threads: 40 cores, 80 logical CPUs |
 | Total across 20 nodes | 800 physical cores, 1,600 logical CPUs |
-| Reported memory | 191544 MiB on 19 nodes; 257064 MiB on `node-03-003` |
-| Slurm partition | `debug`; all 20 reported IDLE in the October 27 check |
+| Memory | Benchmark nodes had sufficient memory for the explicit request |
+| Slurm partition | Administrator-selected partition; check readiness before running |
 | XRF memory request | 185000 MiB per allocated node, regardless of worker count |
-| Recorded software | Rocky Linux 9.8, Slurm 26.05.4, Geant4 11.4.2 with multithreading |
-| Shared Geant4 | `/srv/cluster/software/geant4-11.4.2` |
-| Simulation executable | `/srv/cluster/TEMPO_XRF_REPO/geant4_code/build/sim` |
-| Management Python | `/srv/cluster/TEMPO_XRF_REPO/.venv`, Python 3.11 |
+| Software roles | Linux, Slurm, multithreaded Geant4, Python and Streamlit |
+| Shared Geant4 | Administrator-provided setup script |
+| Simulation executable | `geant4_code/build/sim`, relative to the shared checkout |
+| Management Python | Compatible environment created on the target system |
 | Frontend | `python_code/roboai_xrf_frontend/main.py` |
-| Checked-in launcher's default port | 8502 |
+| Frontend port | Configure locally through `TEMPO_XRF_PORT` |
 
 **NFS shares files; Slurm assigns jobs; Geant4 calculates.** Management runs the
 UI and controller/merger, while compute nodes run simulator processes. All see
-the same `/srv/cluster` path, so the application is not copied to each node.
+the same shared filesystem path, so the application is not copied to each node.
 
-The stale `/home/mnode/TEMPO_XRF_REPO` copy is not production. A home start script
-is only a wrapper around the shared checkout. Management was also reached from
-the laptop at `10.103.8.120` during deployment; use the address reachable from
-your current network, rather than assuming that external address is permanent.
+A stale home-directory copy is not production. A home start script is only a
+wrapper around the shared checkout. Obtain the correct endpoint and checkout
+from private site instructions; do not guess them from an old copy or log.
 
 ## How a simulation runs
 
@@ -201,18 +200,13 @@ promise twice the throughput.
 
 ### Memory
 
-Every chunk explicitly requests `--mem=185000`. Recorded partition settings are:
-
-```text
-MaxNodeCount=20
-PartitionName=debug Nodes=ALL Default=YES MaxTime=INFINITE State=UP DefMemPerCPU=4500 MaxMemPerNode=185000
-```
-
-These are recorded lines, not a complete configuration installer. XRF does
+Every chunk explicitly requests `--mem=185000`. The administrator must ensure
+that the partition permits that request. Site configuration is not included here.
+XRF does
 **not** currently scale requested memory with workers: both 40 and 80 request
-185000 MiB. Without that override, 40 × 4500 implies 180000 MiB while 80 × 4500
-implies 360000 MiB, exceeding the per-node maximum. A ceiling is not an automatic
-capped-memory calculation. Reserved memory is also not actual use; inspect
+185000 MiB. A per-CPU default multiplied by the requested CPU count can exceed a
+per-node maximum. A ceiling is not an automatic capped-memory calculation.
+Reserved memory is also not actual use; inspect
 Slurm accounting's `MaxRSS`, when available, for observed consumption.
 
 ### Seeds and failure handling
@@ -265,11 +259,18 @@ even when its recommendation is no longer the best one.
 
 ### On management
 
-With the existing installed environment:
+With the existing installed environment, set the shared checkout, venv, Geant4
+setup script, listen address and port in your private shell configuration first:
 
 ```bash
-cd /srv/cluster/TEMPO_XRF_REPO || exit 1
-export TEMPO_XRF_REPO=/srv/cluster/TEMPO_XRF_REPO
+: "${TEMPO_XRF_REPO:?Set the shared repository path locally}"
+: "${TEMPO_XRF_VENV:?Set the installed virtualenv path locally}"
+: "${TEMPO_XRF_GEANT4_SETUP:?Set the Geant4 setup script locally}"
+: "${TEMPO_XRF_PORT:?Set the frontend port locally}"
+cd "$TEMPO_XRF_REPO" || exit 1
+export TEMPO_XRF_REPO TEMPO_XRF_VENV TEMPO_XRF_GEANT4_SETUP TEMPO_XRF_PORT
+export TEMPO_XRF_REPO_DIR="$TEMPO_XRF_REPO"
+export TEMPO_XRF_ADDRESS=localhost
 ./start_tempo_xrf.sh --check
 ./start_tempo_xrf.sh
 ```
@@ -283,23 +284,24 @@ separate `TEMPO_XRF_REPO_DIR` override chooses the frontend checkout; one is not
 a substitute for the other. Exporting the former avoids relying on shell setup.
 
 For a home-directory command, preserve any existing wrapper, then edit
-`/home/mnode/start_tempo_xrf.sh` with `nano` to contain:
+`~/start_tempo_xrf.sh` with `nano` to contain (after configuring those variables):
 
 ```bash
 #!/usr/bin/env bash
 set -Eeuo pipefail
-export TEMPO_XRF_REPO=/srv/cluster/TEMPO_XRF_REPO
-exec /srv/cluster/TEMPO_XRF_REPO/start_tempo_xrf.sh "$@"
+: "${TEMPO_XRF_REPO:?Set the shared repository path in your private shell setup}"
+export TEMPO_XRF_REPO
+exec "$TEMPO_XRF_REPO/start_tempo_xrf.sh" "$@"
 ```
 
 Make it executable and start it on management:
 
 ```bash
-chmod +x /home/mnode/start_tempo_xrf.sh
-/home/mnode/start_tempo_xrf.sh
+chmod +x ~/start_tempo_xrf.sh
+~/start_tempo_xrf.sh
 ```
 
-An optional port argument such as `./start_tempo_xrf.sh 8503` overrides 8502.
+An optional numeric port argument overrides the launcher's default.
 Other overrides include `TEMPO_XRF_PORT`, `TEMPO_XRF_ADDRESS`, `TEMPO_XRF_VENV`
 and `TEMPO_XRF_GEANT4_SETUP`. Keep the frontend/controller running during work;
 this branch has not established an independent persistent web service.
@@ -309,11 +311,14 @@ this branch has not established an independent persistent web service.
 Create a tunnel in a laptop terminal:
 
 ```bash
-ssh -N -L 8502:127.0.0.1:8502 mnode@192.168.10.3
+: "${TEMPO_SSH_TARGET:?Set the administrator-provided SSH destination locally}"
+: "${TEMPO_LOCAL_PORT:?Choose an available local port}"
+: "${TEMPO_REMOTE_PORT:?Set the port used by the remote frontend}"
+ssh -N -L "${TEMPO_LOCAL_PORT}:localhost:${TEMPO_REMOTE_PORT}" "$TEMPO_SSH_TARGET"
 ```
 
 Use the reachable management address and match the remote port to the launcher.
-Open `http://localhost:8502`. The SSH tunnel and management frontend are separate
+Open `http://localhost:<local-port>`. The SSH tunnel and management frontend are separate
 processes and both must stay running.
 
 ### A normal simulation
@@ -343,7 +348,7 @@ delete the stored files.
 The standard launcher saves data under:
 
 ```text
-/srv/cluster/TEMPO_XRF_REPO/python_code/roboai_xrf_frontend/runs/
+<shared-checkout>/python_code/roboai_xrf_frontend/runs/
 └── <run-name>/
     ├── config.json, run.mac              current prepared inputs
     ├── simulation.root                 latest published complete result
@@ -371,7 +376,8 @@ need not produce a billion rows.
 On management, list attempts:
 
 ```bash
-cd /srv/cluster/TEMPO_XRF_REPO || exit 1
+: "${TEMPO_XRF_REPO:?Set the shared repository path locally}"
+cd "$TEMPO_XRF_REPO" || exit 1
 source .venv/bin/activate
 ls -lht python_code/roboai_xrf_frontend/runs/full_xrf_example/cluster_runs
 ```
@@ -412,7 +418,8 @@ PY
 Useful read-only Slurm checks:
 
 ```bash
-sinfo -h -N -p debug -o '%N %T %c %m'
+: "${TEMPO_PARTITION:?Set the administrator-approved Slurm partition}"
+sinfo -h -N -p "$TEMPO_PARTITION" -o '%N %T %c %m'
 squeue -u "$USER" -n tempo-xrf
 scontrol ping
 ```
@@ -454,7 +461,7 @@ were verified locally. Existing builder changes, C++ edits, binaries, runs and
 environment-local package changes were preserved rather than assuming upstream
 alone represented the installed application.
 
-`CODEX.txt` captured the original requirements and cluster facts. On October 27,
+Private working notes captured the original requirements and cluster facts. On October 27,
 the upstream `front` branch was checked at `ebabe36`: its eight new commits
 concerned installer/helper files, rather than a runtime cluster change that
 needed porting. Its online rebuild path targeted a different installation and
@@ -484,8 +491,8 @@ errors. Local `sudo` did not fix remote ownership. The home checkout lacked the
 frontend entry point, while the NFS checkout still had it. A setup script also
 could not identify a Git root in the copied directory.
 
-We retained `/srv/cluster/TEMPO_XRF_REPO` and created a working Python 3.11 venv
-there. The copied laptop Python 3.14 environment was unusable; management's
+We retained the shared checkout and created a working Python 3.11 venv
+there. The copied laptop Python environment was unusable; management's
 default Python 3.9 was incompatible with syntax such as `float | None`.
 Imports were checked for Streamlit, NumPy, pandas, Plotly, Pydantic, SpekPy,
 uproot, Awkward, xraylib, Matplotlib, h5py and tqdm. Missing `uproot>=5` was added.
@@ -503,7 +510,7 @@ to the laptop without relocating the simulation.
 
 ### 6. Fix the Slurm spool-path defect
 
-Jobs **147 and 148** allocated a node but exited 127 while looking for
+Two early jobs allocated a node but exited 127 while looking for
 `/var/spool/slurmd/cluster_jobs/run_shard.sbatch`. Slurm executes a spooled batch
 script; inferring the repository from that script's location was wrong.
 Passing the shared repository explicitly fixed it. A regression test now
@@ -511,43 +518,40 @@ executes the controller from a simulated spool directory.
 
 ### 7. Diagnose the apparent Slurm hangs
 
-Munge and `slurmctld` were active, port 6817 listened and `scontrol ping` said UP,
+Munge and `slurmctld` were active, the controller listened and `scontrol ping` said UP,
 but `sinfo`/`squeue` timed out. A controlled restart did not repair it. Connection
 checks, logs and a syscall trace showed the RPC reply arrived; then the client
-stalled resolving `mnode-01.ad.local` externally. That evidence superseded the
+stalled resolving an internal hostname externally. That evidence superseded the
 initial suspicion of a stuck controller.
 
-Management lacked its own hosts entry. After backing up `/etc/hosts` as
-`/etc/hosts.before-tempo-slurm-20261002`, this was added:
-
-```text
-192.168.10.3 mnode-01 mnode-01.ad.local
-```
+Management lacked its own hosts entry. After backing up `/etc/hosts`, the
+administrator added the correct site-specific mapping. Addresses and hostnames
+are intentionally not reproduced here.
 
 Five repeated queries changed from eight-second timeouts to 0.00–0.01-second
 successes. NFS was not the cause of those hangs.
 
 ### 8. Normalize compute-node libraries
 
-Job **150** reached eight nodes but `node-02-002`, `node-02-003` and
-`node-02-004` lacked `libxerces-c-3.2.so`. A common loader probe showed identical
+An eight-node qualification reached every node, but three
+lacked `libxerces-c-3.2.so`. A common loader probe showed identical
 library environments but missing `xerces-c` packages on those three.
 Installation first failed because EPEL was disabled. Enabling `epel-release`
-and installing `xerces-c` repaired it; the recorded version was `3.2.5-1.el9`.
+and installing a compatible `xerces-c` package repaired it.
 The development package was not needed to execute the existing binary.
 
-One node also had an external `eno2` DHCP problem while private `eno1`/NFS stayed
+One node also had an external-interface DHCP problem while private networking/NFS stayed
 healthy. Shared offline RPM staging was discussed; the recorded successful
 repairs used EPEL after connectivity was restored. Source `geant4.sh` before
 interpreting `ldd` results for Geant4 libraries.
 
-Job 150's five successful parts remained an unpublished partial merge. Job
-**154** then passed all eight nodes: 800 events and 49 detector rows. Both
+The five successful parts remained an unpublished partial merge. A rerun
+then passed all eight nodes: 800 events and 49 detector rows. Both
 failure handling and successful completion were exercised on real hardware.
 
 ### 9. Measure 40 versus 80 workers
 
-Jobs **155–160** used paired seeds, alternating order and three repetitions.
+Six worker-comparison jobs used paired seeds, alternating order and three repetitions.
 Eighty won. The 100,000-event tests were too short for absolute production-rate
 calibration; their timing definition and results appear below.
 
@@ -558,8 +562,8 @@ missing cluster integration. Source restoration and shared-venv selection were
 checked before proceeding. Later comparison found large independent
 detector-noise, seed, progress and timing changes in the live application.
 
-We retrieved `management_snapshot_20261027` and built a separate
-`management_candidate_20261027`, merging the queue into production versions.
+We retrieved a private production snapshot and built a separate
+candidate checkout, merging the queue into production versions.
 The production merger's multithreaded uproot file handler was preserved. These
 retrieved controller/UI/merger changes were reconciled into the branch; complete
 checkout/venv byte parity or a whole-machine archive was not established.
@@ -572,7 +576,7 @@ stores source history; NFS distributes the deployed files inside the cluster.
 
 The static per-node split became a throttled array of exclusive one-node chunks
 so freed nodes could take pending work. A clean NFS-visible
-`TEMPO_XRF_QUEUE_TEST` checkout used a symlink to production's executable,
+test checkout used a symlink to production's executable,
 allowing queue validation without replacing the modified live checkout.
 
 ### 12. Repair test packaging and validate selective deployment
@@ -582,15 +586,15 @@ An installed `tests` package shadowed our directory; adding/deploying
 Python preflight invocation; the restored launcher made several. The assertion
 was corrected to require that every call use the intended repository venv.
 
-Job **589** passed eight chunks on four nodes in the clean checkout; job **597**
-passed 40 chunks across all 20. The reviewed candidate was selectively deployed
-with backups under `.deployment_backups/before_dynamic_queue_job597`.
-Job **637** passed production's controller and preserved merger. The suite grew
+A small qualification passed eight chunks on four nodes in the clean checkout;
+the expanded test passed 40 chunks across all 20. The reviewed candidate was
+selectively deployed with backups of replaced files. A production qualification
+passed its controller and preserved merger. The suite grew
 from 14 to 17 to 23 tests, all 23 later passing on management.
 
 ### 13. Replace guessed chunk sizes with production measurements
 
-Job **805** ran a billion events at 70 workers and four chunks/node. Every node
+A representative run used a billion events at 70 workers and four chunks/node. Every node
 did four chunks; node-total times varied by only 1.15% coefficient of variation.
 Extra queue depth did not meaningfully redistribute this uniform workload.
 
@@ -650,10 +654,11 @@ executables, `/etc` settings or simulation results.
 On management:
 
 ```bash
-cd /srv/cluster/TEMPO_XRF_REPO || exit 1
+: "${TEMPO_XRF_REPO:?Set the shared repository path locally}"
+cd "$TEMPO_XRF_REPO" || exit 1
 source .venv/bin/activate
-export PYTHONPATH=/srv/cluster/TEMPO_XRF_REPO
-export TEMPO_XRF_REPO=/srv/cluster/TEMPO_XRF_REPO
+export PYTHONPATH="$TEMPO_XRF_REPO"
+export TEMPO_XRF_REPO
 python -m unittest -v tests.test_cluster_jobs
 bash -n cluster_jobs/run_cluster.sbatch
 bash -n cluster_jobs/run_shard.sbatch
@@ -679,29 +684,30 @@ comma-separated names target one node or subset. For 20 selected nodes it
 requests 2,000 events in 40 chunks. Inspect actual distribution: the test does
 not require every eligible node to run a chunk. It uses `publish=False`.
 
-| Job(s) | Recorded result |
+| Qualification | Recorded result |
 |---|---|
-| 147, 148 | Failed spool path; later reproduced and repaired |
-| 150 | Five successes/three missing-library failures; partial not published |
-| 154 | Eight-node path: 800 events, eight nodes, 49 rows |
-| 155–160 | Six successful paired worker tests |
-| 589 | Clean queue: 8 chunks, 4 nodes, 400 events |
-| 597 | Clean queue: 40 chunks, 20 actual nodes, 2,000 events, 119 rows |
-| 637 | Production queue: 8 chunks, 4 nodes, 400 events, 5 rows |
-| 805 | Production: 1 billion events, 20 nodes, 70 workers, 80 chunks |
-| 925, 945, 965, 1005, 1045, 1125 | Production benchmark matrix below |
+| Initial launches | Failed spool path; later reproduced and repaired |
+| Runtime check | Five successes/three missing-library failures; partial not published |
+| Repaired runtime | Eight-node path: 800 events, eight nodes, 49 rows |
+| Worker comparison | Six successful paired worker tests |
+| Small queue | 8 chunks, 4 nodes, 400 events |
+| Expanded queue | 40 chunks, 20 actual nodes, 2,000 events, 119 rows |
+| Production queue | 8 chunks, 4 nodes, 400 events, 5 rows |
+| Representative production | 1 billion events, 20 nodes, 70 workers, 80 chunks |
+| Throughput comparison | Production benchmark matrix below |
 
 Different row counts across tests do not alone show event loss or accuracy;
 the configuration and random samples also matter.
 
 ### Initial 40/80 comparison
 
-Historical command:
+Equivalent command after choosing a qualified node locally:
 
 ```bash
+: "${TEMPO_BENCHMARK_NODE:?Set one qualified node name locally}"
 python cluster_jobs/benchmark_workers.py \
   python_code/roboai_xrf_frontend/runs/full_xrf_example \
-  --node node-01-001 --events 100000 --repetitions 3 --seed-base 424242
+  --node "$TEMPO_BENCHMARK_NODE" --events 100000 --repetitions 3 --seed-base 424242
 ```
 
 Both modes use the same exclusive node and paired seeds, with alternating order
@@ -741,14 +747,14 @@ initialization, execution, validation and merge. `publish=False` retains
 artifacts without replacing the published result. JSON includes every job,
 node distribution, elapsed time, run path, per-worker winner and overall winner.
 
-| Workers/node | Chunks/selected node | Job | Wall seconds | Events/s |
-|---:|---:|---:|---:|---:|
-| 70 | 1 | 925 | 106.664 | 4,687,623.83 |
-| 80 | 1 | 945 | **97.658** | **5,119,920.84** |
-| 70 | 2 | 965 | 111.262 | 4,493,892.23 |
-| 80 | 2 | 1005 | 106.205 | 4,707,859.15 |
-| 70 | 4 | 1045 | 124.804 | 4,006,266.53 |
-| 80 | 4 | 1125 | 114.991 | 4,348,161.68 |
+| Workers/node | Chunks/selected node | Wall seconds | Events/s |
+|---:|---:|---:|---:|
+| 70 | 1 | 106.664 | 4,687,623.83 |
+| 80 | 1 | **97.658** | **5,119,920.84** |
+| 70 | 2 | 111.262 | 4,493,892.23 |
+| 80 | 2 | 106.205 | 4,707,859.15 |
+| 70 | 4 | 124.804 | 4,006,266.53 |
+| 80 | 4 | 114.991 | 4,348,161.68 |
 
 Every run used 20 actual nodes. The winner was 9.22% faster than 70/1 and 27.80%
 faster than 70/4 in the same matrix. At 80 workers, two/four chunks were about
@@ -764,19 +770,18 @@ The approximately nine-second difference between controller wall time and the
 longest node process is combined overhead, **not measured merge time alone**.
 Inspect per-run manifest phases before assigning it to storage or scheduling.
 
-The retained JSON is at the following management path (shown wrapped):
+Benchmark JSON stays in the prepared run's local artifacts:
 
 ```text
-/srv/cluster/TEMPO_XRF_REPO/python_code/roboai_xrf_frontend/runs/
-full_xrf_example/benchmarks/20261027_140740_chunks.json
+<prepared-run-directory>/benchmarks/<timestamp>_chunks.json
 ```
 
 Automatic reads it there. Downloading a copy is optional review, not installation.
-Raw benchmark JSON is run data and is not currently committed source.
+Raw benchmark JSON is run data and is not currently committed source. It can
+contain machine names and absolute paths; review and redact it before sharing.
 With one repetition, a reported “median” is a single measurement. After hardware
 changes, prefer three alternating repetitions under comparable load. Benchmarks
-reserve nodes and retain output: check space first. The dated job805 directory
-used 326 MiB; management then had 46 GiB free on a 70-GiB filesystem.
+reserve nodes and retain output: check local capacity and retention policy first.
 
 ## Deployment and adding nodes
 
@@ -793,7 +798,10 @@ was used for this purpose.
 From the **laptop**, preview the explicit integration file list:
 
 ```bash
-cd /home/nutty/Documents/TEMPO_XRF_REPO || exit 1
+: "${TEMPO_SOURCE_CHECKOUT:?Set your local development checkout path}"
+: "${TEMPO_XRF_DEPLOY_TARGET:?Set the private SSH destination and shared path locally}"
+export TEMPO_XRF_DEPLOY_TARGET
+cd "$TEMPO_SOURCE_CHECKOUT" || exit 1
 ./deploy_to_mnode.sh --dry-run
 ```
 
@@ -821,7 +829,7 @@ For a new node:
 
 1. Configure private networking, hostname resolution and compatible Munge/Slurm;
    register the node in the intended partition.
-2. Mount `/srv/cluster` at the same path and verify access as the simulation user.
+2. Mount the shared filesystem at the agreed path and verify access as the simulation user.
 3. Verify Geant4/data and loader dependencies after sourcing `geant4.sh`.
 4. Check topology/memory against the current 40-core/80-thread assumptions and
    fixed 185000-MiB request.
@@ -831,8 +839,8 @@ For a new node:
 
 Discovery uses `TEMPO_XRF_CLUSTER_NODES`, then Slurm, then the historical eight
 nodes; the UI caches it for 30 seconds. It does not filter DOWN/DRAIN nodes.
-Appearance in the selector is not readiness. Before expansion beyond 20, review
-`MaxNodeCount=20`, node definitions, partition policy and array limits too.
+Appearance in the selector is not readiness. Before expansion, review
+the configured maximum node count, node definitions, partition policy and array limits too.
 
 ## Bottlenecks and future work
 
