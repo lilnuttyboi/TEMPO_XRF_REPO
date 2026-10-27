@@ -102,7 +102,10 @@ def merge_shards(root: Path, shard_ids: Iterable[int] | None = None) -> dict:
                 if not source.is_file():
                     raise FileNotFoundError(f"Missing successful shard output: {source}")
 
-                with uproot.open(source) as file:
+                with uproot.open(
+                    source,
+                    handler=uproot.source.file.MultithreadedFileSource,
+                ) as file:
                     tree = file["MyTree"]
                     for batch in tree.iterate(
                         list(schema), step_size="64 MB", library="np", how=dict
@@ -159,7 +162,10 @@ def merge_shards(root: Path, shard_ids: Iterable[int] | None = None) -> dict:
         metadata_temporary.unlink(missing_ok=True)
         raise
 
-    with uproot.open(output) as file:
+    with uproot.open(
+        output,
+        handler=uproot.source.file.MultithreadedFileSource,
+    ) as file:
         print(f"Combined: {output}")
         print(f"Simulated events: {offset}")
         print(f"MyTree rows: {file['MyTree'].num_entries}")

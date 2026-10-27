@@ -14,7 +14,14 @@ REPO_PATH = Path(__file__).resolve().parents[3]
 if str(REPO_PATH) not in sys.path:
     sys.path.append(str(REPO_PATH))
 
-from cluster_jobs.cluster_config import calculate_queue_shape, discover_nodes
+from cluster_jobs.cluster_config import (
+    MAX_CHUNKS_PER_NODE,
+    RECOMMENDED_CHUNK_SECONDS,
+    calculate_queue_shape,
+    discover_nodes,
+    estimate_node_throughput,
+    recommend_chunks_per_node,
+)
 from components.common import page_header
 from state import (
     configuration_fingerprint,
@@ -62,9 +69,7 @@ def _finalize_finished_process() -> None:
     st.session_state.geant4_running = False
     st.session_state.geant4_process = None
 
-    # ------------------------------------------------------
     # FAILED
-    # ------------------------------------------------------
 
     if return_code != 0:
 
@@ -77,9 +82,7 @@ def _finalize_finished_process() -> None:
 
         return
 
-    # ------------------------------------------------------
     # SUCCESS
-    # ------------------------------------------------------
 
     sim = st.session_state.get(
         "simulation"
@@ -114,9 +117,7 @@ def _finalize_finished_process() -> None:
 
         return
 
-    # ------------------------------------------------------
     # COMPLETE
-    # ------------------------------------------------------
 
     st.session_state.run_complete = True
     st.session_state.last_root_file = str(
@@ -133,26 +134,19 @@ def _running_simulation_panel():
     )
 
     if process is None:
+        st.info("No simulation process found.")
         return
-
 
     if sim is None:
-        st.warning("No simulation object")
+        st.warning("No simulation object.")
         return
-    if sim.run_total > 0:
-        percent = min(
-            100,
-            int(
-                sim.run_progress
-                / sim.run_total
-                * 100
-            ),
-        )
+    if sim._tqdm_output =="":
+        return
+    current_percentage=sim._tqdm_output/sim._total_run
 
-        st.progress(
-            percent / 100,
-            text=f"Geant4: {percent}%",
-        )
+
+
+    st.progress(current_percentage, text=f"Geant4: {int(current_percentage*100)}%")
     if process.poll() is None:
 
         if st.button(
@@ -164,7 +158,7 @@ def _running_simulation_panel():
 
             stop_geant4_process()
             st.rerun()
-        return 
+        return
 
     _finalize_finished_process()
 
@@ -217,15 +211,15 @@ def render_run_page():
             format="%d",
         )
 
-        print_display = c2.number_input(
-            "Print progress every",
-            min_value=1,
-            value=int(
-                run["print_display"]
-            ),
-            step=1000,
-            format="%d",
-        )
+        # print_display = c2.number_input(
+        #     "Print progress every",
+        #     min_value=1,
+        #     value=int(
+        #         run["print_display"]
+        #     ),
+        #     step=1000,
+        #     format="%d",
+        # )
 
         c1, c2 = st.columns(2)
 
@@ -257,9 +251,9 @@ def render_run_page():
                     "number_of_thread": int(
                         threads
                     ),
-                    "print_display": int(
-                        print_display
-                    ),
+                    # "print_display": int(
+                    #     print_display
+                    # ),
                     "vis_beam_on": int(
                         vis_beam
                     ),
@@ -302,42 +296,82 @@ def render_run_page():
                 "more chunks as they become free. The list is refreshed from Slurm."
             ),
         )
-        chunks_per_node = int(
-            st.number_input(
-                "Queued chunks per node",
-                min_value=1,
-                max_value=32,
-                value=4,
-                step=1,
-                key="cluster_chunks_per_node",
-                help=(
-                    "Four is the recommended starting point. More chunks improve "
-                    "load balancing, but very short chunks add Slurm and Geant4 "
-                    "startup overhead."
-                ),
+        recommended_chunks = (
+            recommend_chunks_per_node(
+                int(run["beam_on"]),
+                len(selected_nodes),
+                int(run["number_of_thread"]),
             )
+            if selected_nodes
+            else 1
         )
+        queue_sizing_mode = st.radio(
+            "Queue sizing",
+            options=("Automatic (recommended)", "Manual"),
+            horizontal=True,
+            key="cluster_queue_sizing_mode",
+        )
+        if queue_sizing_mode == "Automatic (recommended)":
+            chunks_per_node = recommended_chunks
+            st.caption(
+                f"Automatic recommendation: {chunks_per_node} chunk(s) per "
+                f"selected node. It targets about "
+                f"{RECOMMENDED_CHUNK_SECONDS:g} seconds per chunk using the "
+                "measured full-XRF cluster rate."
+            )
+        else:
+            chunks_per_node = int(
+                st.number_input(
+                    "Chunks per selected node",
+                    min_value=1,
+                    max_value=MAX_CHUNKS_PER_NODE,
+                    value=recommended_chunks,
+                    step=1,
+                    key="manual_cluster_chunks_per_node",
+                    help=(
+                        "This value is per selected node, not the total. More "
+                        "chunks improve load balancing, but short chunks repeat "
+                        "Slurm and Geant4 startup overhead."
+                    ),
+                )
+            )
     st.caption(
         f"Node inventory: {inventory_source}. "
         f"Workers per selected node: {int(run['number_of_thread'])}."
     )
     if selected_nodes:
+        saved_events = int(run["beam_on"])
         chunk_count, max_concurrent = calculate_queue_shape(
-            int(run["beam_on"]),
+            saved_events,
             len(selected_nodes),
             chunks_per_node,
         )
-        smallest_chunk, extra = divmod(int(run["beam_on"]), chunk_count)
+        smallest_chunk, extra = divmod(saved_events, chunk_count)
         largest_chunk = smallest_chunk + (1 if extra else 0)
         chunk_size = (
-            str(smallest_chunk)
+            f"{smallest_chunk:,}"
             if smallest_chunk == largest_chunk
-            else f"{smallest_chunk}-{largest_chunk}"
+            else f"{smallest_chunk:,}-{largest_chunk:,}"
+        )
+        estimated_seconds = largest_chunk / estimate_node_throughput(
+            int(run["number_of_thread"])
         )
         st.caption(
-            f"Queue: {chunk_count} chunks of about {chunk_size} events; "
-            f"up to {max_concurrent} run at once."
+            f"Queue for the saved {saved_events:,}-event total: {chunk_count} "
+            f"chunks of about {chunk_size} events; up to {max_concurrent} run "
+            f"at once; estimated {estimated_seconds:.1f} seconds per chunk."
         )
+        st.caption(
+            "After changing Beam-on events or Workers per node, click "
+            "Save run settings to update this recommendation. Actual duration "
+            "depends on the geometry and physics configuration."
+        )
+        if estimated_seconds < 10:
+            st.warning(
+                "Estimated chunks are under 10 seconds, so startup overhead may "
+                "be significant. For maximum efficiency, consider selecting "
+                "fewer nodes for this event total."
+            )
     if inventory_warning:
         st.caption(inventory_warning)
 
@@ -404,6 +438,8 @@ def render_run_page():
                 simulation = build_simulation(cfg)
 
                 simulation.compile()
+
+                print("config path",simulation.config_path)
 
             st.session_state.simulation = simulation
 
@@ -486,9 +522,7 @@ def render_run_page():
 
         except Exception as exc:
             st.exception(exc)
-    # ----------------------------------------------------------
     # PERSISTENT VISUALIZATION LINK
-    # ----------------------------------------------------------
 
     viewer_url = st.session_state.get(
         "viewer_url"
@@ -508,9 +542,7 @@ def render_run_page():
             width="stretch",
         )
 
-    # ----------------------------------------------------------
     # 3. RUN GEANT4
-    # ----------------------------------------------------------
 
     if run_clicked:
 
@@ -560,10 +592,8 @@ def render_run_page():
 
             st.exception(exc)
 
-    # ==========================================================
     # LIVE / FINISHED SIMULATION STATUS
     # FULL WIDTH because this is NOT inside c3
-    # ==========================================================
 
     if st.session_state.get(
         "geant4_process"
@@ -606,9 +636,7 @@ def render_run_page():
 
     st.divider()
 
-    # ==========================================================
     # GENERATED CONFIGURATION
-    # ==========================================================
 
     st.subheader(
         "Generated configuration"

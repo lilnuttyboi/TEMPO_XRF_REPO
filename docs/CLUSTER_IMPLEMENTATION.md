@@ -118,10 +118,12 @@ complete merge is published as the run's simulation.root
 ```
 
 The distributed implementation uses a Slurm job array instead of reserving every
-node in one gang allocation. By default it creates four chunks per selected node
-and limits concurrent array elements to the number of selected nodes. Each array
-element requests one exclusive node. When a fast node completes, Slurm can place
-another pending chunk there; a slower node naturally completes fewer chunks.
+node in one gang allocation. Automatic queue sizing targets approximately 30
+seconds per chunk using the measured 40/80-worker rates, while Manual mode allows
+1--32 chunks per selected node. Concurrent array elements are limited to the
+number of selected nodes. Each array element requests one exclusive node. When a
+fast node completes, Slurm can place another pending chunk there; a slower node
+naturally completes fewer chunks.
 
 ### Node selection
 
@@ -161,9 +163,10 @@ The UI provides:
 - **Single node**: choose one compute node; the same safe shard-and-merge path is
   used with one chunk by default.
 - **Distributed**: choose any number of nodes; all discovered nodes are selected
-  by default. **Queued chunks per node** defaults to four and accepts 1 through
-  32. The UI shows the resulting chunk count, approximate events per chunk, and
-  maximum concurrency before submission.
+  by default. **Queue sizing** defaults to Automatic. Manual mode accepts 1
+  through 32 chunks per selected node. The UI shows the saved event total,
+  resulting chunk count, approximate events and estimated duration per chunk,
+  and maximum concurrency before submission.
 
 ### Event splitting
 
@@ -378,8 +381,10 @@ The Build & run page now:
 - caches inventory for 30 seconds;
 - displays Single node and Distributed modes;
 - allows a configurable node selection instead of a fixed five-node checkbox;
-- exposes **Queued chunks per node**, defaulting to four for Distributed mode;
-- shows calculated chunks, event size, and maximum concurrency;
+- defaults to **Automatic (recommended)** queue sizing and retains a 1--32
+  chunks-per-selected-node Manual override;
+- shows the saved event total, calculated chunks, event size, estimated chunk
+  duration, and maximum concurrency;
 - defaults distributed selection to every discovered node;
 - displays the inventory source and any discovery warning;
 - labels the thread setting Workers per node and caps it at 80;
@@ -555,8 +560,11 @@ failure verified the publication safety gate.
 ### Automated tests
 
 The original 14 cluster tests passed on the laptop and in the management virtual
-environment. After the dynamic queue change, 17 tests pass locally; the updated
-suite still needs to be run on management:
+environment. The dynamic queue raised this to 17 tests, which passed on
+management before and after selective production deployment. Automatic queue
+sizing adds two recommendation tests, bringing the current local suite to 19;
+rerun those 19 on management after selectively deploying the automatic-sizing
+update:
 
 ```bash
 cd /srv/cluster/TEMPO_XRF_REPO
@@ -665,9 +673,10 @@ Then open `http://localhost:8502`.
 6. Click **Save run settings**.
 7. Choose **Single node** for a test or **Distributed** and the desired nodes for
    production.
-8. For Distributed mode, leave **Queued chunks per node** at 4 initially. Check
-   the displayed chunk count and events per chunk; increase it only when chunks
-   remain long enough that startup overhead is small.
+8. For Distributed mode, leave **Queue sizing** on **Automatic (recommended)**
+   initially. Confirm that the preview shows the intended saved event total. Use
+   Manual mode only when measurements for the current physics configuration show
+   that the estimate is unsuitable.
 9. Click **1. Build & compile**.
 10. Optionally use **2. Open visualization** to check geometry. A visualization
    is not a quantitative run.
@@ -823,12 +832,13 @@ python cluster_jobs/benchmark_workers.py \
 - The current benchmark clearly favors 80 workers for the tested workload, but
   a longer benchmark is advisable if the event physics or output density changes
   substantially.
-- Four chunks per node is an initial balancing setting. Very small chunks can
-  reduce throughput because every chunk initializes Geant4 and creates a ROOT
-  file. Measure representative 1, 2, 4, and 8 chunk-per-node runs before changing
-  the production default.
-- The dynamic job-array path has local automated coverage but still requires its
-  first real management smoke test after selective deployment.
+- Automatic chunk sizing is a heuristic based on the measured full-XRF workload.
+  Very small chunks can reduce throughput because every chunk initializes Geant4
+  and creates a ROOT file. Measure representative Automatic, 1, 2, 4, and 8
+  chunk-per-node runs when geometry or physics changes materially.
+- The dynamic job-array path passed clean-checkout and production-checkout Slurm
+  smoke tests, including all 20 nodes in job 597 and the production merger in job
+  637. A UI-submitted run remains the final frontend-path check.
 - Keep all nodes provisioned consistently, including the EPEL Xerces runtime.
 - Keep `mnode-01` resolvable locally through `/etc/hosts`; Slurm client commands
   should not depend on external DNS.

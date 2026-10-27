@@ -3,14 +3,13 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import ClassVar, Sequence
-import sys
 import numpy as np
 import plotly.graph_objects as go
 import subprocess
 import socket
-import time 
+import time
 from pydantic import BaseModel, PrivateAttr
-import os 
+import os
 import signal
 import threading
 from .config.xrfconfig import XRFConfigure
@@ -19,8 +18,8 @@ from .detector_noise.xray_tube import get_flu
 from .detector_noise.pipeline import apply_detectornoise
 from plotly.subplots import make_subplots
 from tqdm import tqdm
-import re 
-
+import re
+import sys
 class RoboAiXrfSimulation(BaseModel):
     """
     RoboAI XRF simulation controller.
@@ -47,49 +46,27 @@ class RoboAiXrfSimulation(BaseModel):
     config: XRFConfigure
     config_path: Path
 
+    # Internal package path; this is not part of the user's simulation config.
     ROOTPATH: ClassVar[Path] = Path(__file__).resolve().parent
-
+    _total_run:int=PrivateAttr(default=0)
     _beam_on: int = PrivateAttr(default=0)
     _is_compiled: bool = PrivateAttr(default=False)
-    _run_output: str = PrivateAttr(default="")
 
     _energy_bin: np.ndarray | None = PrivateAttr(default=None)
     _fluence_list: np.ndarray | None = PrivateAttr(default=None)
 
     _last_mas: float | None = PrivateAttr(default=None)
     _last_incident_photons: float | None = PrivateAttr(default=None)
+    _run_done:threading.Event=PrivateAttr(    default_factory=threading.Event)
+    _tqdm_output:str|None=PrivateAttr(default="")
 
-    _run_done: threading.Event = PrivateAttr(
-    default_factory=threading.Event
-)
 
-    _run_progress: int = PrivateAttr(default=0)
-    _run_total: int = PrivateAttr(default=0)
 
-    # ======================================================
-    # GEANT4 LIVE PROGRESS
-    # ======================================================
 
-    _run_progress: int = PrivateAttr(default=0)
-    _run_total: int = PrivateAttr(default=0) 
-    
     @property
     def is_compiled(self) -> bool:
         return self._is_compiled
-    @property
-    def run_output(self) -> str:
-        return self._run_output
-    @property
-    def run_progress(self) -> int:
-        return self._run_progress
 
-    @property
-    def run_output(self) -> str:
-        return "\n".join(self._run_output)
-    @property
-    def run_total(self) -> int:
-        return self._run_total
-    
     @property
     def beam_on(self) -> int:
         return self._beam_on
@@ -110,6 +87,11 @@ class RoboAiXrfSimulation(BaseModel):
     def last_incident_photons(self) -> float | None:
         return self._last_incident_photons
 
+    @property
+    def get_latest_tqdm_output(self)->str|None:
+        return self._tqdm_output
+
+
     def model_post_init(self, __context) -> None:
         self.config.validate_complete()
 
@@ -119,80 +101,62 @@ class RoboAiXrfSimulation(BaseModel):
             exist_ok=True,
         )
 
+
     def _get_tube_inputs(self):
         """
-        Collect the X-ray tube source inputs.
+        Collect the tube values .
 
         Returns
         -------
-        tuple
-            (True, (...)) for a SpekPy-generated source.
-            (False, (...)) for a user-provided spectrum file.
+        tube
+            X-ray tube configuration.
+        filters
+            SpekPy filter dictionaries.
+        source_to_collimator_mm
+            Focal-spot-to-virtual-collimator distance in mm.
         """
         tube = self.config.xray_tube
-
         if tube is None:
-            raise ValueError(
-                "X-ray tube configuration is missing."
-            )
+                raise ValueError("X-ray tube configuration is missing.")
+
+        source_to_sample_mm = tube.placement.position.distance_mm
+
+        window_to_sample_mm = tube.tube_window_to_sample_distance_mm
+
+        window_to_collimator_mm = tube.tube_window_to_virtual_collimator_distance_mm
+
+        tube_internal_length_mm = source_to_sample_mm- window_to_sample_mm
+        source_to_collimator_mm = tube_internal_length_mm+ window_to_collimator_mm
+
+        if tube_internal_length_mm < 0:
+                raise ValueError(
+                    "Focal-spot-to-sample distance cannot be smaller "
+                    "than tube-window-to-sample distance."
+                )
+
+
+        if source_to_collimator_mm <= 0:
+                raise ValueError(
+                    "Focal-spot-to-collimator distance must be greater than 0."
+                )
 
         if tube.is_spekpy_tube:
-            source_to_sample_mm = (
-                tube.placement.position.distance_mm
-            )
 
-            window_to_sample_mm = (
-                tube.tube_window_to_sample_distance_mm
-            )
-
-            window_to_collimator_mm = (
-                tube.tube_window_to_virtual_collimator_distance_mm
-            )
-
-            tube_internal_length_mm = (
-                source_to_sample_mm
-                - window_to_sample_mm
-            )
-
-            if tube_internal_length_mm < 0:
-                raise ValueError(
-                    "Focal-spot-to-sample distance cannot be "
-                    "smaller than tube-window-to-sample distance."
-                )
-
-            source_to_collimator_mm = (
-                tube_internal_length_mm
-                + window_to_collimator_mm
-            )
-
-            if source_to_collimator_mm <= 0:
-                raise ValueError(
-                    "Focal-spot-to-collimator distance must be "
-                    "greater than 0."
-                )
 
             filters = [
                 f.model_dump()
                 for f in tube.tube_filter_spekpy
             ]
 
-            return True, (
-                tube,
-                filters,
-                source_to_collimator_mm,
-            )
+            return tube.is_spekpy_tube, (tube, filters, source_to_collimator_mm)
+        else:
+            spectrum_file_path=tube.spectrum_file_path
 
-        spectrum_file_path = tube.spectrum_file_path
+            if spectrum_file_path is None:
+                raise ValueError("Spectrum file path should not be none")
 
-        if spectrum_file_path is None:
-            raise ValueError(
-                "Spectrum file path is missing."
-            )
+            return tube.is_spekpy_tube,(tube,spectrum_file_path)
 
-        return False, (
-            tube,
-            spectrum_file_path,
-        )
 
     def write_spectrum_plot( self,energy_mev: np.ndarray, count: np.ndarray) -> Path:
         """
@@ -302,45 +266,35 @@ class RoboAiXrfSimulation(BaseModel):
         """
         Prepare the source spectrum and Geant4 JSON configuration.
 
-        For a SpekPy source, the spectrum shape is generated at 1 mAs.
+        The source spectrum is generated at 1 mAs because mAs changes
+        intensity, not the normalized source-energy shape.
 
-        For an uploaded spectrum, the two-column file is read directly:
-            energy [keV]
-            intensity [photons/s/keV]
-
-        Both source types are converted into the same Geant4 GPS
-        energy histogram.
+        Actual current/time scaling is done later in detector_noise()
+        by calling SpekPy again with the user's requested mAs.
         """
-        is_spekpy_tube, other = self._get_tube_inputs()
-
+        is_spekpy_tube,other = self._get_tube_inputs()
         if is_spekpy_tube:
-            (
-                tube,
-                filters,
-                source_to_collimator_mm,
-            ) = other
+            tube,filters,source_to_collimator_mm=other
 
-            energy_bin_kev, fluence_list, _ = get_flu(
-                mas=1.0,
-                voltage=tube.voltage_kv,
-                anode_degree=tube.anode_angle_deg,
-                anode_target_material=tube.anode_symbol,
-                filters=filters,
-                source_to_tube_collimator_mm=(
-                    source_to_collimator_mm
-                ),
-                tube_type=tube.tube_type,
-                target_thickness_um=tube.target_thickness_um,
-            )
-
+            energy_bin_kev,fluence_list, _= get_flu(
+                            mas=1.0,
+                            voltage=tube.voltage_kv,
+                            anode_degree=tube.anode_angle_deg,
+                            anode_target_material=tube.anode_symbol,
+                            filters=filters,
+                            source_to_tube_collimator_mm=source_to_collimator_mm,
+                            tube_type=tube.tube_type,
+                            target_thickness_um=tube.target_thickness_um,
+                        )
         else:
-            tube, spectrum_file_path = other
+            tube,spectrum_file_path=other
+            energy_bin_kev,fluence_list=tube._read(spectrum_file_path)
 
-            energy_bin_kev, fluence_list = tube._read(
-                spectrum_file_path
-            )
 
-        # Geant4 GPS energy values are stored in MeV.
+
+
+
+
         self._energy_bin = np.asarray(
             energy_bin_kev,
             dtype=np.float64,
@@ -351,40 +305,23 @@ class RoboAiXrfSimulation(BaseModel):
             dtype=np.float64,
         )
 
+
         if self._energy_bin.size == 0:
-            raise ValueError(
-                "Source spectrum returned no energy bins."
-            )
+            raise ValueError(" Returned no energy bins.")
 
         if self._fluence_list.size != self._energy_bin.size:
             raise ValueError(
-                "Source spectrum energy and intensity arrays "
-                "have different lengths."
-            )
-
-        if not np.all(np.isfinite(self._energy_bin)):
-            raise ValueError(
-                "Source spectrum contains non-finite energy values."
+                " Energy and fluence arrays have different lengths."
             )
 
         if not np.all(np.isfinite(self._fluence_list)):
             raise ValueError(
-                "Source spectrum contains non-finite intensity values."
-            )
-
-        if np.any(self._energy_bin <= 0):
-            raise ValueError(
-                "Source spectrum energies must be greater than 0."
-            )
-
-        if np.any(self._fluence_list < 0):
-            raise ValueError(
-                "Source spectrum intensities cannot be negative."
+                " Source spectrum contains non-finite values."
             )
 
         if np.sum(self._fluence_list) <= 0:
             raise ValueError(
-                "Source spectrum has zero total intensity."
+                " Source spectrum has zero total fluence."
             )
 
         write_json(
@@ -396,7 +333,6 @@ class RoboAiXrfSimulation(BaseModel):
         self._last_mas = None
         self._last_incident_photons = None
         self._is_compiled = True
-
     def port_is_open(self,port_number: int) -> bool:
         with socket.socket(
             socket.AF_INET,
@@ -411,7 +347,6 @@ class RoboAiXrfSimulation(BaseModel):
                 )
                 == 0
             )
-
     def show_vis(self,beam_on: int = 100,number_of_thread: int = 1,port:int=5173) -> None:
         """
         Run a small visualization simulation and launch the Vite viewer.
@@ -454,7 +389,7 @@ class RoboAiXrfSimulation(BaseModel):
 
         )
         with open(self.ROOTPATH/"vis"/"public"/"geant4_debug.log","w") as f:
-            
+
             f.write(process.stdout)
         viewer_url = f"http://localhost:{port}"
 
@@ -476,25 +411,23 @@ class RoboAiXrfSimulation(BaseModel):
             while not self.port_is_open(port):
                 if time.time()-start_time>10:
                     raise RuntimeError(
-                                        "Vite viewer failed to start on port 5173."
+                                        f"Vite viewer failed to start on port {port}."
                                     )
                 time.sleep(0.1)
 
         print(f"Visualization ready at : {viewer_url}")
         return viewer_url
+    def start_run(self,beam_on: int,number_of_thread: int,cluster_nodes: int | str | Sequence[str] = 1,cluster_chunks_per_node: int = 1,) -> subprocess.Popen:
 
-    def start_run(
-        self,
-        beam_on: int,
-        number_of_thread: int,
-        show_progress_terminal: bool = False,
-        cluster_nodes: int | str | Sequence[str] = 1,
-        cluster_chunks_per_node: int = 1,
-    ) -> subprocess.Popen:
-        
+        """
+        Run the quantitative Geant4 response simulation.
+
+        Returns
+        -------
+        subprocess.Popen
+        """
         self._run_done.clear()
-        self._run_progress = 0
-        self._run_total = int(beam_on)
+        self._total_run=beam_on
         if not self.is_compiled:
             raise RuntimeError(
                 "Call simulation.compile() first."
@@ -506,14 +439,15 @@ class RoboAiXrfSimulation(BaseModel):
         if chunks_per_node < 1:
             raise ValueError("cluster_chunks_per_node must be at least 1.")
 
-        print_display = max(
-            1,
-            int(beam_on / 1000),
-        )
+
+
+        print_display=max(1,beam_on//1000)
+
+
 
         _, macro_file_path = self.write_macro(
             beam_on=beam_on,
-            number_of_thread=workers,
+            number_of_thread=number_of_thread,
             print_display=print_display,
         )
 
@@ -521,25 +455,21 @@ class RoboAiXrfSimulation(BaseModel):
             self.config_path / "config.json"
         )
 
+
         root_file = (
             self.config_path / "simulation.root"
         )
 
-        repo_candidates = []
-        configured_repo = os.environ.get("TEMPO_XRF_REPO")
-        if configured_repo:
-            repo_candidates.append(Path(configured_repo).expanduser().resolve())
-        repo_candidates.append(self.ROOTPATH.parent.resolve())
-        repo_candidates.extend(self.config_path.resolve().parents)
-        repo = next(
-            (
-                candidate
-                for candidate in repo_candidates
-                if (candidate / "cluster_jobs" / "ui_cluster_run.py").is_file()
-                and (candidate / "geant4_code" / "build" / "sim").is_file()
-            ),
-            None,
-        )
+
+        self._beam_on = 0
+        try:
+            env_path = os.environ["TEMPO_XRF_REPO"]
+        except KeyError:
+            raise KeyError(
+                "TEMPO_XRF_REPO is not set. Set it to your repository path."
+            ) from None
+
+        repo = Path(env_path).expanduser().resolve()
         if repo is None:
             raise FileNotFoundError(
                 "Could not locate the TEMPO XRF repository. Set TEMPO_XRF_REPO "
@@ -547,6 +477,7 @@ class RoboAiXrfSimulation(BaseModel):
             )
 
         build_dir = repo / "geant4_code" / "build"
+
         launch_command = [
             sys.executable,
             str(repo / "cluster_jobs" / "ui_cluster_run.py"),
@@ -558,104 +489,104 @@ class RoboAiXrfSimulation(BaseModel):
         ]
         if isinstance(cluster_nodes, int):
             if cluster_nodes < 1:
-                raise ValueError("cluster_nodes must be at least 1.")
-            launch_command.extend(["--node-count", str(cluster_nodes)])
+                raise ValueError("Select at least one node.")
+
+            launch_command += ["--node-count", str(cluster_nodes)]
+
         else:
             if isinstance(cluster_nodes, str):
-                selected_nodes = cluster_nodes
+                nodes = cluster_nodes
             else:
-                selected_nodes = ",".join(str(node) for node in cluster_nodes)
-            if not selected_nodes.strip():
-                raise ValueError("Select at least one cluster node.")
-            launch_command.extend(["--nodes", selected_nodes])
+                nodes = ",".join(str(node) for node in cluster_nodes)
 
-        self._beam_on = 0
+            if not nodes.strip():
+                raise ValueError("Select at least one node.")
+
+            launch_command += ["--nodes", nodes]
+
         if root_file.exists():
             root_file.unlink()
-        bar = tqdm(
+        bar=tqdm(
             total=beam_on,
             desc="RoboAI XRF Simulation",
             unit="Event",
             colour="green",
         )
-
-        process = subprocess.Popen(
+        process=subprocess.Popen(
             launch_command,
             cwd=build_dir,
             start_new_session=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+
+            text=True
+
         )
 
-        def _watch_background_run() -> None:
-    
-            last_number = 0
+
+        def _watch_background_run()->None:
+            last_number=0
 
             if process.stdout is not None:
-
                 for line in process.stdout:
+                    tqdm.write(line.rstrip())
 
-                    match = re.search(
-                        r"Event\s+(\d+)",
-                        line,
-                    )
-
+                    match=re.search(r"Event\s+(\d+)",line)
                     if match:
-
-                        event_number = int(
-                            match.group(1)
-                        )
-
-                        if event_number > last_number:
-
+                        event_number=int(match.group(1))
+                        if event_number>last_number:
                             bar.update(
-                                event_number - last_number
+                                event_number-last_number
                             )
+                            last_number=event_number
+                            self._tqdm_output=last_number
 
-                            last_number = event_number
+            return_code=process.wait()
 
-                            self._run_progress = min(
-                                event_number,
-                                beam_on,
-                            )
-            return_code = process.wait()
-
-            if return_code == 0 and root_file.is_file():
-
-                if last_number < beam_on:
-                    bar.update(
-                        beam_on - last_number
-                    )
-
-                self._beam_on = int(beam_on)
-                self._run_progress = int(beam_on)
-
+            if return_code==0 and root_file.is_file():
+                self._beam_on=int(beam_on)
             else:
-                self._beam_on = 0
-
-            bar.close()
+                self._beam_on=0
             self._run_done.set()
 
-        threading.Thread(
-            target=_watch_background_run,
-            daemon=True,
-        ).start()
-
+        threading.Thread(target=_watch_background_run,daemon=True).start()
+        # _watch_background_run()
         return process
-    
-    def run(self,beam_on:int,number_of_thread:int):
-        
+
+    def run(self, beam_on: int, number_of_thread: int):
+        process = None
+
         try:
-            process=self.start_run(beam_on=beam_on,number_of_thread=number_of_thread)
+            process = self.start_run(
+                beam_on=beam_on,
+                number_of_thread=number_of_thread,
+            )
+
             self._run_done.wait()
+
+            if process.returncode != 0:
+                raise RuntimeError(
+                    f"Simulation launcher failed with exit code "
+                    f"{process.returncode}. Check the output above."
+                )
+
+            root_file = self.config_path.resolve() / "simulation.root"
+
+            if not root_file.is_file():
+                raise RuntimeError(
+                    f"Simulation output was not created: {root_file}"
+                )
+
+            if self._beam_on < 2:
+                raise RuntimeError(
+                    "Simulation did not register a valid quantitative run."
+                )
+
         except KeyboardInterrupt:
             self.stop_run(process=process)
-        
-    
+            raise
     def stop_run(self,process:subprocess.Popen|None)->None:
-        
+
         """
         Stop a background Geant4 simulation.
 
@@ -665,10 +596,8 @@ class RoboAiXrfSimulation(BaseModel):
         Any partial simulation.root is deleted because it is not a
         valid quantitative response.
         """
-        
-        self._beam_on = 0
-        self._run_progress = 0
-        self._run_total = 0
+
+        self._beam_on=0
         if process is not None and process.poll() is None:
             try:
                 os.killpg(
@@ -684,8 +613,8 @@ class RoboAiXrfSimulation(BaseModel):
                     )
                     process.wait()
             except ProcessLookupError:
-                pass 
-            
+                pass
+
             except Exception:
                 try:
                     process.terminate()
@@ -696,46 +625,40 @@ class RoboAiXrfSimulation(BaseModel):
                         process.wait()
 
                     except Exception:
-                        pass 
+                        pass
         root_file=self.config_path/"simulation.root"
         if root_file.exists():
             try:
                 root_file.unlink()
             except OSError:
-                pass 
+                pass
 
-        
 
-    def detector_noise(
-        self,
-        *,
-        fwhm: float,
-        fwhm_energy_kev: float,
-        detector_zero_offset: float,
-        detector_gain_kev: float,
-        live_time: float,
-        pile_up_window_us: float,
-        current: float | None = None,
-        fano_factor: float = 0.115,
-        pair_creation_energy_ev: float = 3.6,
-        mca_channels: int = 2048,
-        chunk_size: int = 3_000_000,
-        number_of_buckets: int = 65,
-    ):
+
+    def detector_noise(self,*,fwhm: float,fwhm_energy_kev: float,detector_zero_offset: float,detector_gain_kev: float,
+                        live_time: float, pile_up_window_us: float,current: float | None = None,fano_factor: float = 0.115,
+                        pair_creation_energy_ev: float = 3.6,mca_channels: int = 2048,chunk_size: int = 3_000_000,number_of_buckets: int = 65,simulation_time_s:int=3600,
+                        seed:int|None=None):
         """
         Create the physical detector spectrum for a requested acquisition.
 
-        SpekPy source
-        -------------
-        The physical photon count is recalculated from tube current and
-        live time using SpekPy.
+        Important
+        ---------
+        Current and live time do NOT change the stored Geant4 source shape.
+        Instead:
 
-        Uploaded spectrum
-        -----------------
-        The uploaded second column is treated as photons/s/keV.
-        Current is therefore not used. The physical photon count is:
+            mAs = current[mA] * simulation_time_s[s]
 
-            integral(intensity dE) * live_time
+        SpekPy is called again with that mAs to obtain the physical fluence.
+        That fluence is multiplied by the tube-collimator area to obtain
+        the physical number of incident photons.
+
+        The current defaults to config.xray_tube.current_ma when current=None.
+        If the spectrum is from the reading custom file current will be neglected
+
+        seed: optional nonnegative integer. When set, the pile-up and
+        broadening random draws are deterministic (same seed => same spectrum);
+        default None keeps the historical non-reproducible behaviour.
         """
         if not self.is_compiled:
             raise RuntimeError(
@@ -748,17 +671,21 @@ class RoboAiXrfSimulation(BaseModel):
                 "Call simulation.run() with beam_on >= 2 first."
             )
 
+        if not np.isfinite(simulation_time_s) or simulation_time_s <= 0:            raise RuntimeError(
+                "simulation time s cannot be negative or inf value must be finite positive value"
+            )
         root_file = self.config_path / "simulation.root"
+
 
         if not root_file.is_file():
             raise FileNotFoundError(
                 f"simulation.root not found: {root_file}"
             )
 
-        if live_time <= 0:
+        if  not np.isfinite(live_time) or live_time <= 0:
             raise ValueError(
-                "live_time must be greater than 0 seconds."
-            )
+                            "live_time must be greater than 0 seconds. or must be finite positive number"
+                        )
 
         if detector_gain_kev <= 0:
             raise ValueError(
@@ -770,24 +697,20 @@ class RoboAiXrfSimulation(BaseModel):
                 "mca_channels must be greater than 0."
             )
 
-        if (
-            self._energy_bin is None
-            or self._fluence_list is None
+        if seed is not None and (
+            isinstance(seed, bool)
+            or not isinstance(seed, (int, np.integer))
+            or seed < 0
         ):
-            raise RuntimeError(
-                "Source spectrum is missing. "
-                "Call simulation.compile() first."
+            raise ValueError(
+                "seed must be a nonnegative integer or None."
             )
 
-        is_spekpy_tube, other = self._get_tube_inputs()
-
+        is_spekpy_tube, other= (
+            self._get_tube_inputs()
+        )
         if is_spekpy_tube:
-            (
-                tube,
-                filters,
-                source_to_collimator_mm,
-            ) = other
-
+            tube,filters, source_to_collimator_mm=other
             if current is None:
                 current = float(tube.current_ma)
 
@@ -797,7 +720,9 @@ class RoboAiXrfSimulation(BaseModel):
                 )
 
             # mA * s = mAs
-            mas = current * live_time
+            simulation_time_s=min(live_time,simulation_time_s)
+
+            mas = current *simulation_time_s
 
             _, _, fluence_photons_cm2 = get_flu(
                 mas=mas,
@@ -805,102 +730,38 @@ class RoboAiXrfSimulation(BaseModel):
                 anode_degree=tube.anode_angle_deg,
                 anode_target_material=tube.anode_symbol,
                 filters=filters,
-                source_to_tube_collimator_mm=(
-                    source_to_collimator_mm
-                ),
+                source_to_tube_collimator_mm=source_to_collimator_mm,
                 tube_type=tube.tube_type,
                 target_thickness_um=tube.target_thickness_um,
             )
 
-            # SpekPy fluence is photons/cm².
-            # Convert configured collimator radius from mm to cm.
+            # Tube-collimator radius is configured in mm.
+            # SpekPy fluence is photons/cm², so convert radius to cm.
             radius_cm = (
                 tube.tube_collimator_radius_mm / 10.0
             )
 
-            area_cm2 = np.pi * radius_cm**2
+            area_cm2 = (
+                np.pi * radius_cm**2
+            )
 
+            # photons/cm² * cm² = photons
             number_of_photon = (
                 float(fluence_photons_cm2)
                 * area_cm2
             )
+            self._last_mas = current*live_time
 
-            self._last_mas = mas
 
-            acquisition_title = (
-                f"{current:g} mA, {live_time:g} s"
-            )
-
-            print(
-                "\n========== PHYSICAL ACQUISITION =========="
-            )
-            print("Spectrum source: SpekPy")
-            print("Current:", current, "mA")
-            print("Live time:", live_time, "s")
-            print("Exposure:", mas, "mAs")
-            print(
-                "SpekPy fluence:",
-                fluence_photons_cm2,
-                "photons/cm²",
-            )
-            print(
-                "Collimator radius:",
-                tube.tube_collimator_radius_mm,
-                "mm",
-            )
-            print(
-                "Collimator area:",
-                area_cm2,
-                "cm²",
-            )
 
         else:
-            tube, spectrum_file_path = other
+            tube,spectrum_file_path=other
+            number_of_photon=np.trapezoid(
+                self._fluence_list,
+                self._energy_bin*1000
+            )*simulation_time_s
 
-            # _energy_bin is stored in MeV, so convert it back to keV.
-            energy_kev = self._energy_bin * 1000.0
-
-            # Uploaded intensity is photons/s/keV.
-            photon_rate = float(
-                np.trapezoid(
-                    self._fluence_list,
-                    energy_kev,
-                )
-            )
-
-            number_of_photon = (
-                photon_rate * live_time
-            )
-
-            self._last_mas = None
-
-            acquisition_title = (
-                f"uploaded spectrum, {live_time:g} s"
-            )
-
-            print(
-                "\n========== PHYSICAL ACQUISITION =========="
-            )
-            print("Spectrum source: uploaded file")
-            print(
-                "Spectrum file:",
-                spectrum_file_path,
-            )
-            print("Live time:", live_time, "s")
-            print(
-                "Integrated photon rate:",
-                photon_rate,
-                "photons/s",
-            )
-
-        self._last_incident_photons = (
-            number_of_photon
-        )
-
-        print(
-            "Physical photons through collimator:",
-            number_of_photon,
-        )
+        self._last_incident_photons = number_of_photon * live_time / simulation_time_s
 
         (
             final_count,
@@ -912,15 +773,20 @@ class RoboAiXrfSimulation(BaseModel):
             spectrum_se,
         ) = apply_detectornoise(
             root_path=root_file,
+
             beam_on=self._beam_on,
+
             number_of_photon=number_of_photon,
-            live_time=live_time,
+
+            live_time=simulation_time_s,
 
             fwhm=fwhm,
             fwhm_energy=fwhm_energy_kev,
 
             detector_zero_offset=detector_zero_offset,
+
             detector_gain=detector_gain_kev,
+
             pile_up_window=pile_up_window_us,
 
             fano_factor=fano_factor,
@@ -931,7 +797,14 @@ class RoboAiXrfSimulation(BaseModel):
             mca_channels=mca_channels,
             chunk_size=chunk_size,
             number_of_buckets=number_of_buckets,
+            seed=seed,
         )
+
+        scaling_factor=live_time/simulation_time_s
+        final_count=final_count.astype(np.float64)
+        scaled_count=scaled_count.astype(np.float64)
+        final_count*=scaling_factor
+        scaled_count*=scaling_factor
 
         fig = make_subplots(
             rows=1,
@@ -991,7 +864,8 @@ class RoboAiXrfSimulation(BaseModel):
         fig.update_layout(
             title=(
                 "XRF Simulated Spectrum "
-                f"({acquisition_title})"
+                + (f"({current:g} mA, {live_time:g} s)" if is_spekpy_tube
+                 else f"(custom source, {live_time:g} s)")
             ),
             template="plotly_white",
             height=600,
@@ -1021,8 +895,6 @@ class RoboAiXrfSimulation(BaseModel):
             spectrum_yield_avg,
             spectrum_se,
         )
-
-    
 
 if __name__=="__main__":
     pass

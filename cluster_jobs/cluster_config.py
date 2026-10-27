@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import re
@@ -19,6 +20,10 @@ DEFAULT_PARTITION = "debug"
 MEMORY_MIB_PER_NODE = 185_000
 PHYSICAL_CORES_PER_NODE = 40
 LOGICAL_CPUS_PER_NODE = 80
+MEASURED_EVENTS_PER_SECOND_40 = 22_568.57
+MEASURED_EVENTS_PER_SECOND_80 = 28_557.48
+RECOMMENDED_CHUNK_SECONDS = 30.0
+MAX_CHUNKS_PER_NODE = 32
 NODE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -118,6 +123,55 @@ def validate_chunks_per_node(chunks_per_node: int) -> int:
     if chunks_per_node < 1:
         raise ValueError("Chunks per node must be at least 1.")
     return chunks_per_node
+
+
+def estimate_node_throughput(workers: int) -> float:
+    """Estimate events/s from the measured 40/80-worker cluster benchmark."""
+    workers = validate_workers(workers)
+    if workers <= PHYSICAL_CORES_PER_NODE:
+        return MEASURED_EVENTS_PER_SECOND_40 * (
+            workers / PHYSICAL_CORES_PER_NODE
+        )
+
+    logical_fraction = (
+        workers - PHYSICAL_CORES_PER_NODE
+    ) / PHYSICAL_CORES_PER_NODE
+    return MEASURED_EVENTS_PER_SECOND_40 + logical_fraction * (
+        MEASURED_EVENTS_PER_SECOND_80 - MEASURED_EVENTS_PER_SECOND_40
+    )
+
+
+def recommend_chunks_per_node(
+    total_events: int,
+    node_count: int,
+    workers: int,
+    *,
+    target_chunk_seconds: float = RECOMMENDED_CHUNK_SECONDS,
+    max_chunks_per_node: int = MAX_CHUNKS_PER_NODE,
+) -> int:
+    """Recommend queue depth while keeping each chunk long enough to be useful.
+
+    This is a throughput heuristic based on the measured full-XRF benchmark.
+    Different physics or geometry may run at a different rate, so the UI keeps a
+    manual override.
+    """
+    total_events = int(total_events)
+    node_count = int(node_count)
+    max_chunks_per_node = validate_chunks_per_node(max_chunks_per_node)
+    if total_events < 1:
+        raise ValueError("Total events must be at least 1.")
+    if node_count < 1:
+        raise ValueError("Node count must be at least 1.")
+    if not math.isfinite(target_chunk_seconds) or target_chunk_seconds <= 0:
+        raise ValueError("Target chunk duration must be finite and greater than 0.")
+
+    target_events = max(
+        1,
+        int(estimate_node_throughput(workers) * target_chunk_seconds),
+    )
+    required_chunks = max(1, math.ceil(total_events / target_events))
+    chunks_per_node = max(1, math.ceil(required_chunks / node_count))
+    return min(chunks_per_node, max_chunks_per_node)
 
 
 def calculate_queue_shape(

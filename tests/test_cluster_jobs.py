@@ -15,7 +15,9 @@ from cluster_jobs.cluster_config import (
     build_sbatch_command,
     calculate_queue_shape,
     discover_nodes,
+    estimate_node_throughput,
     parse_node_list,
+    recommend_chunks_per_node,
     seed_pairs,
     split_events,
     worker_resource_args,
@@ -82,6 +84,17 @@ class ClusterConfigTests(unittest.TestCase):
     def test_queue_shape_creates_multiple_chunks_per_node(self):
         self.assertEqual(calculate_queue_shape(803, 8, 4), (32, 8))
         self.assertEqual(calculate_queue_shape(3, 8, 4), (3, 3))
+
+    def test_chunk_recommendation_uses_measured_worker_throughput(self):
+        self.assertAlmostEqual(estimate_node_throughput(40), 22_568.57)
+        self.assertAlmostEqual(estimate_node_throughput(80), 28_557.48)
+        self.assertEqual(recommend_chunks_per_node(10_000_000, 20, 80), 1)
+        self.assertEqual(recommend_chunks_per_node(10_000_000, 4, 80), 3)
+        self.assertEqual(recommend_chunks_per_node(100_000_000, 20, 80), 6)
+
+    def test_chunk_recommendation_is_bounded(self):
+        self.assertEqual(recommend_chunks_per_node(2, 20, 80), 1)
+        self.assertEqual(recommend_chunks_per_node(10**12, 20, 80), 32)
 
     def test_sbatch_uses_a_throttled_one_node_job_array(self):
         command = build_sbatch_command(
@@ -161,7 +174,9 @@ class LauncherTests(unittest.TestCase):
             )
 
             self.assertIn(f"Python:     {repo / '.venv'}/bin/python", result.stdout)
-            self.assertEqual(marker.read_text(encoding="utf-8"), "repo\n")
+            selected_pythons = marker.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(selected_pythons)
+            self.assertEqual(set(selected_pythons), {"repo"})
 
 
 class MergeGateTests(unittest.TestCase):

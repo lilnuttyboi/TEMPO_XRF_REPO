@@ -15,7 +15,9 @@ checks = {
     ),
     repo / "python_code" / "roboai_xrf_frontend" / "components" / "run_page.py": (
         'options=("Single node", "Distributed")',
-        '"Queued chunks per node"',
+        '"Automatic (recommended)"',
+        '"Chunks per selected node"',
+        "recommend_chunks_per_node",
     ),
     repo / "cluster_jobs" / "ui_cluster_run.py": (
         "def run_cluster(",

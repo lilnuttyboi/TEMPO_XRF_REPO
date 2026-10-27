@@ -18,10 +18,12 @@ The quantitative-run path is:
    `simulation.root`, and starts `cluster_jobs/ui_cluster_run.py`.
 3. The cluster controller creates an immutable run directory below the compiled
    frontend run and submits `cluster_jobs/run_cluster.sbatch` as a throttled Slurm
-   job array. Distributed UI runs default to four queued chunks per selected node;
-   the array concurrency limit equals the selected-node count. Each array element
-   requests one exclusive node, so a node that finishes can receive the next
-   pending chunk instead of waiting for the slowest original assignment.
+   job array. Distributed UI runs automatically recommend chunks per selected
+   node from the saved event total, selected-node count, worker count, and measured
+   cluster throughput; a 1--32 manual override remains available. The array
+   concurrency limit equals the selected-node count. Each array element requests
+   one exclusive node, so a node that finishes can receive the next pending chunk
+   instead of waiting for the slowest original assignment.
 4. Each array element starts one `run_shard.sbatch` process. Every chunk has its
    own folder, event count, random seeds, macro, viewer-output path, and
    `simulation.root`. The shared repository path is passed explicitly because
@@ -41,13 +43,14 @@ The quantitative-run path is:
 - Management/login host: `mnode@mnode-01` (`192.168.10.3`).
 - Shared repository: `/srv/cluster/TEMPO_XRF_REPO`, previously branch `front`.
 - The original verified compute set was `node-01-[001-004]` and
-  `node-02-[001-004]` (eight total). Slurm later reported 20 registered names,
-  through `node-05-004`; only `node-01-[001-004]` were `IDLE` in that later
-  snapshot and the remaining nodes were `DOWN`/`DOWN*`. Live discovery includes
-  registered nodes regardless of state, so readiness still requires `sinfo`.
-- Each node: 40 physical cores, 80 logical CPUs with Hyper-Threading, and
-  191544 MiB reported to Slurm. Reported topology is two sockets, 20 physical
-  cores per socket, and two hardware threads per core.
+  `node-02-[001-004]` (eight total). On 2026-10-27 Slurm reported all 20
+  registered nodes, through `node-05-004`, as `IDLE`. Live discovery includes
+  registered nodes regardless of state, so every new session still requires a
+  readiness check with `sinfo`.
+- Each node: 40 physical cores and 80 logical CPUs with Hyper-Threading. Nineteen
+  nodes reported 191544 MiB to Slurm on 2026-10-27; `node-03-003` reported
+  257064 MiB. Reported topology is two sockets, 20 physical cores per socket,
+  and two hardware threads per core.
 - Per-node job memory request: `--mem=185000`.
 - The `debug` partition is now configured with `DefMemPerCPU=4500` and
   `MaxMemPerNode=185000`. TEMPO XRF's explicit `--mem=185000` takes precedence
@@ -202,12 +205,44 @@ closes the original eight-node execution and Xerces failure reproduction loop.
 - The management checkout was reported as being restored after an accidental
   replacement, but its final commit/file parity with this laptop branch has not
   been re-verified.
-- The Slurm job-array queue is locally implemented and tested but has not yet had
-  a live management smoke test. Confirm array scheduling, repeated-node work
-  pickup, NFS markers, and complete merging before production use.
-- Four chunks per node is the approved starting point, not a universal optimum.
-  Production chunks should ideally run for tens of seconds to several minutes;
-  compare queue sizes with a representative simulation after deployment.
+- A 2026-10-27 comparison between the live production checkout and the clean
+  queue-test checkout found substantial overlap: `roboaixrf/main.py` produced a
+  927-line diff and the frontend `run_page.py` a 229-line diff. Production has
+  detector-noise, simulation-time, seed, and progress changes that are unrelated
+  to the queue and must be preserved. All eight compared `cluster_jobs` runtime
+  files also differ, including `combine_shards.py`. Do not copy these files over
+  production wholesale; review the complete cluster diff and port only the
+  dynamic-queue changes into the restored production implementation.
+- The exact production versions of `roboaixrf/main.py`, frontend `run_page.py`,
+  and `combine_shards.py` were retrieved into `management_snapshot_20261027` on
+  the laptop. A separate `management_candidate_20261027` preserves the production
+  controller/UI behavior, adds only the queue argument, selector, preview, and
+  launcher flags, and uses the seven queue runtime files. Production's
+  `combine_shards.py` is retained byte-for-byte, including its explicit uproot
+  multithreaded file handler. The candidate passed all 17 cluster tests, Python
+  compilation, both batch-script syntax checks, and the integration verifier.
+  It was then used for the guarded selective production transfer.
+- The guarded transfer to `/srv/cluster/TEMPO_XRF_REPO` completed with backups
+  under `.deployment_backups/before_dynamic_queue_job597`. Initial production
+  validation passed the 15 queue/runtime tests, the integration verifier, both
+  batch syntax checks, and the offline launcher preflight. Two ancillary tests
+  failed: production still had an older `deploy_to_mnode.sh` that omitted
+  `tests/__init__.py`, and the restored launcher invokes the selected Python three
+  times during preflight while the test required exactly one invocation. Every
+  recorded invocation was the repository venv (`repo`), so no stale home venv was
+  selected. The regression assertion now accepts one or more invocations only if
+  all use the repository venv, and the current deployment helper includes the
+  package marker. Both the laptop and merged-candidate suites then passed all 17
+  tests. After deploying those two corrected files, the production suite also
+  passed all 17 tests.
+- The Slurm job-array queue passed live management smoke tests from both the
+  clean side-by-side checkout and the selectively merged production checkout.
+  Restarting the production UI and submitting one small UI-driven queue run are
+  the remaining operational checks.
+- Automatic queue sizing uses the measured full-XRF 40/80-worker rates and a
+  30-second target, but other geometry and physics configurations may differ.
+  Compare the recommendation with representative production measurements and
+  use Manual mode when the estimate is not representative.
 - Management's original Python environment is no longer available at its
   reported path. The current `/home/mnode/TEMPO_XRF_REPO/.venv` is an incomplete
   root-owned copy of the laptop Python 3.14 venv: it contains `pip3.14` but no
@@ -243,10 +278,19 @@ tests/test_cluster_jobs.py -v`.
   selecting it for production.
 - Single-node and distributed modes both use the same validated controller path.
 - A distributed run creates `selected_nodes * chunks_per_node` chunks, limited by
-  the event count. The UI default is four chunks per node. Slurm receives a
-  one-node job array with `%selected_nodes` throttling, so at most one full-node
-  chunk runs per selected node at once and newly free nodes take pending chunks.
-  Single-node UI runs use one chunk by default.
+  the event count. Automatic mode estimates per-node throughput by scaling to the
+  measured 22568.57 events/s at 40 workers and interpolating up to 28557.48
+  events/s at 80 workers. It targets approximately 30 seconds per chunk and
+  returns 1--32 chunks per selected node. Manual mode can override that value
+  within the same bounds. Slurm receives a one-node job array with
+  `%selected_nodes` throttling, so at most one full-node chunk runs per selected
+  node at once and newly free nodes take pending chunks. Single-node UI runs use
+  one chunk by default.
+- Queue calculations use the saved Beam-on events value. The UI names and formats
+  that total explicitly and instructs the user to click **Save run settings**
+  after editing events or workers. The confusing preview of 80 chunks at 1,250
+  events came from the previously saved 100,000-event value; 10,000,000 events
+  with that same explicit queue shape would have produced 125,000-event chunks.
 - For `N` chunks, chunk `i` receives
   `total // N + (i < total % N)` events. No zero-event shards are created.
 - Each shard receives a unique adjacent seed pair derived from a recorded seed
@@ -285,17 +329,19 @@ bash -n cluster_jobs/run_cluster.sbatch cluster_jobs/run_shard.sbatch
 git diff --check
 ```
 
-All 17 unit/integration tests passed. The tests cover eight-node fallback and
-future-node override discovery, exact event division, independent seeds,
-40/80 CPU and memory flags, throttled job-array submission, repeated-node queue
-completion, per-node accounting, success-marker gating, an end-to-end shard macro
-rewrite with a fake simulator, and execution of the controller from a simulated
-Slurm spool path. This laptop has no Slurm client, so a real array allocation
-still requires management.
+All 19 unit/integration tests passed. The tests cover eight-node fallback and
+future-node override discovery, exact event division, measured-throughput chunk
+recommendations and bounds, independent seeds, 40/80 CPU and memory flags,
+throttled job-array submission, repeated-node queue completion, per-node
+accounting, success-marker gating, an end-to-end shard macro rewrite with a fake
+simulator, and execution of the controller from a simulated Slurm spool path.
+This laptop has no Slurm client, so the real array allocation was validated on
+management as recorded below.
 
-The same 14-test suite passed under the clean Python 3.11 management venv after
-the explicit shared-repository argument fix was selectively deployed. This
-verifies the fix on management but is not yet a real Slurm allocation test.
+The current 17-test suite also passed under the Python 3.11 management venv from
+the clean NFS-visible checkout `/srv/cluster/TEMPO_XRF_QUEUE_TEST`. Both batch
+scripts passed `bash -n`, and `patch_ui.py` confirmed that cluster integration is
+present.
 
 ## Verify management before deployment
 
@@ -469,8 +515,40 @@ python cluster_jobs/cluster_smoke_test.py \
 The command prints the artifact directory and `node_summary`. Inspect
 `run_manifest.json`, `combined_response.json`, and each
 `logs/slurm-<array>_<chunk>.log`; the first chunk line records node, event count,
-worker count, allocated CPUs, affinity, and seeds. This new array test is still
-outstanding on management.
+worker count, allocated CPUs, affinity, and seeds.
+
+The first live dynamic-queue smoke test passed on management on 2026-10-27 as
+Slurm job 589. It ran commit `550f820` from the clean side-by-side checkout
+`/srv/cluster/TEMPO_XRF_QUEUE_TEST`, using `node-01-001` through
+`node-01-004`, 40 workers, two chunks per node, and 100 total events per selected
+node. Slurm completed all eight queued chunks with a maximum concurrency of four.
+Each node processed two chunks and 100 events; all 400 requested events validated
+and merged successfully. The artifacts are under
+`cluster_runs/20261027_125541_62cba83c_cluster-smoke` in that checkout's
+`full_xrf_example` run directory. This validates array scheduling, repeated-node
+work pickup, shared-NFS markers, complete-result gating, and merging. It does not
+yet replace the dirty production checkout or prove the best production chunk
+duration.
+
+A subsequent all-node qualification passed as Slurm job 597. It discovered and
+selected all 20 registered nodes from `node-01-001` through `node-05-004`, queued
+40 chunks with maximum concurrency 20, and completed two 50-event chunks on every
+node. All 2,000 requested events validated and merged; the combined ROOT file had
+119 `MyTree` rows. Its artifacts are under
+`cluster_runs/20261027_125803_da9009d6_cluster-smoke` in the clean checkout's
+`full_xrf_example` run directory. This verifies the NFS path, executable runtime
+dependencies, 40-CPU allocations, result markers, and queue execution on all 20
+nodes.
+
+After the selective merge into `/srv/cluster/TEMPO_XRF_REPO`, the production
+path passed its smoke test as Slurm job 637. It used `node-01-001` through
+`node-01-004`, queued eight chunks with concurrency four, completed two 50-event
+chunks on every node, and validated and merged all 400 requested events. The
+preserved production `combine_shards.py` completed successfully and reported
+five `MyTree` rows. Artifacts are under
+`cluster_runs/20261027_131259_55dae82c_cluster-smoke` in the production
+`full_xrf_example` run directory. This closes the production-path deployment and
+merger compatibility check; only a frontend restart and UI-submitted run remain.
 
 ## Repeatable 40-versus-80 benchmark
 
