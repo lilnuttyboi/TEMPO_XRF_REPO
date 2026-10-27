@@ -56,6 +56,7 @@ def main() -> None:
                 workers=workers,
                 nodes=(node,),
                 seed_base=pair_seed,
+                chunks_per_node=1,
                 partition=args.partition,
                 publish=False,
                 label=f"benchmark-r{repetition + 1}-w{workers}",

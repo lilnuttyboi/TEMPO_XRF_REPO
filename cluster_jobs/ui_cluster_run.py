@@ -24,10 +24,12 @@ if str(REPO) not in sys.path:
 
 from cluster_jobs.cluster_config import (  # noqa: E402
     build_sbatch_command,
+    calculate_queue_shape,
     choose_nodes,
     parse_node_list,
     seed_pairs,
     split_events,
+    validate_chunks_per_node,
     validate_workers,
 )
 
@@ -66,20 +68,25 @@ def run_cluster(
     workers: int,
     nodes: Sequence[str],
     seed_base: int | None = None,
+    chunks_per_node: int = 1,
     partition: str | None = None,
     publish: bool = True,
     label: str | None = None,
 ) -> dict:
-    """Run one shard per selected node and return the completed run manifest."""
+    """Run a throttled queue of chunks and return the completed run manifest."""
     config_dir = config_dir.resolve()
     total_events = int(total_events)
     workers = validate_workers(workers)
+    chunks_per_node = validate_chunks_per_node(chunks_per_node)
     selected_nodes = parse_node_list(nodes)
     if total_events < 1:
         raise ValueError("Total events must be at least 1.")
 
-    shard_count = min(total_events, len(selected_nodes))
-    selected_nodes = selected_nodes[:shard_count]
+    shard_count, max_concurrent = calculate_queue_shape(
+        total_events,
+        len(selected_nodes),
+        chunks_per_node,
+    )
     counts = split_events(total_events, shard_count)
     if seed_base is None:
         seed_base = secrets.randbelow(1_000_000_000) + 1
@@ -101,10 +108,11 @@ def run_cluster(
         workers=workers,
         nodes=selected_nodes,
         seed_base=seed_base,
+        chunks_per_node=chunks_per_node,
         partition=partition,
     )
     manifest = {
-        "version": 2,
+        "version": 3,
         "status": "submitting",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "config_dir": str(config_dir),
@@ -112,6 +120,10 @@ def run_cluster(
         "requested_events": total_events,
         "workers_per_node": workers,
         "selected_nodes": list(selected_nodes),
+        "chunks_per_node": chunks_per_node,
+        "chunk_count": shard_count,
+        "max_concurrent_chunks": max_concurrent,
+        # Retained for compatibility with the existing validated merger.
         "shard_count": shard_count,
         "event_counts": list(counts),
         "seed_base": seed_base,
@@ -141,7 +153,11 @@ def run_cluster(
 
         print(f"Submitted Slurm job {job_id}", flush=True)
         print(f"Selected nodes: {','.join(selected_nodes)}", flush=True)
-        print(f"Shard results: {run_root}", flush=True)
+        print(
+            f"Queued chunks: {shard_count}; maximum concurrent: {max_concurrent}",
+            flush=True,
+        )
+        print(f"Chunk results: {run_root}", flush=True)
 
         positions = [0] * shard_count
         completed = [0] * shard_count
@@ -229,14 +245,15 @@ def run_cluster(
                 )
 
         actual_nodes = [status["node"] for status in statuses]
-        if len(actual_nodes) != len(set(actual_nodes)):
-            failures.append(
-                {
-                    "id": None,
-                    "reason": f"Shards did not use distinct nodes: {actual_nodes}",
-                    "log_tail": "",
-                }
+        node_summary = {}
+        for status in statuses:
+            summary = node_summary.setdefault(
+                status["node"],
+                {"chunks": 0, "events": 0, "elapsed_ns": 0},
             )
+            summary["chunks"] += 1
+            summary["events"] += int(status["events"])
+            summary["elapsed_ns"] += int(status.get("elapsed_ns", 0))
 
         if successful_ids:
             subprocess.run(
@@ -253,6 +270,7 @@ def run_cluster(
         manifest["successful_shards"] = successful_ids
         manifest["failed_shards"] = failures
         manifest["actual_nodes"] = actual_nodes
+        manifest["node_summary"] = node_summary
         manifest["status"] = "failed" if failures else "shards_complete"
         _write_json(run_root / "run_manifest.json", manifest)
 
@@ -318,6 +336,7 @@ def _parse_args() -> argparse.Namespace:
     selection.add_argument("--node-count", type=int, default=None)
     parser.add_argument("--partition")
     parser.add_argument("--seed-base", type=int)
+    parser.add_argument("--chunks-per-node", type=int, default=1)
     parser.add_argument("--label")
     parser.add_argument("--no-publish", action="store_true")
     return parser.parse_args()
@@ -336,6 +355,7 @@ def main() -> None:
         workers=args.workers,
         nodes=nodes,
         seed_base=args.seed_base,
+        chunks_per_node=args.chunks_per_node,
         partition=args.partition,
         publish=not args.no_publish,
         label=args.label,

@@ -113,6 +113,31 @@ def validate_workers(workers: int) -> int:
     return workers
 
 
+def validate_chunks_per_node(chunks_per_node: int) -> int:
+    chunks_per_node = int(chunks_per_node)
+    if chunks_per_node < 1:
+        raise ValueError("Chunks per node must be at least 1.")
+    return chunks_per_node
+
+
+def calculate_queue_shape(
+    total_events: int,
+    node_count: int,
+    chunks_per_node: int,
+) -> tuple[int, int]:
+    """Return total array chunks and the maximum concurrent array tasks."""
+    total_events = int(total_events)
+    node_count = int(node_count)
+    chunks_per_node = validate_chunks_per_node(chunks_per_node)
+    if total_events < 1:
+        raise ValueError("Total events must be at least 1.")
+    if node_count < 1:
+        raise ValueError("Node count must be at least 1.")
+
+    chunk_count = min(total_events, node_count * chunks_per_node)
+    return chunk_count, min(node_count, chunk_count)
+
+
 def split_events(total_events: int, shard_count: int) -> tuple[int, ...]:
     total_events = int(total_events)
     shard_count = int(shard_count)
@@ -159,11 +184,15 @@ def build_sbatch_command(
     workers: int,
     nodes: Sequence[str],
     seed_base: int,
+    chunks_per_node: int = 1,
     partition: str | None = None,
 ) -> list[str]:
     selected_nodes = parse_node_list(nodes)
-    shard_count = min(int(total_events), len(selected_nodes))
-    selected_nodes = selected_nodes[:shard_count]
+    shard_count, max_concurrent = calculate_queue_shape(
+        total_events,
+        len(selected_nodes),
+        chunks_per_node,
+    )
     split_events(total_events, shard_count)
     seed_pairs(seed_base, shard_count)
     selected_partition = partition or os.environ.get(
@@ -175,15 +204,16 @@ def build_sbatch_command(
         "--parsable",
         f"--partition={selected_partition}",
         "--job-name=tempo-xrf",
-        f"--nodes={shard_count}",
-        f"--ntasks={shard_count}",
+        "--nodes=1",
+        "--ntasks=1",
         "--ntasks-per-node=1",
         "--exclusive",
+        f"--array=0-{shard_count - 1}%{max_concurrent}",
         f"--nodelist={','.join(selected_nodes)}",
         *worker_resource_args(workers),
         "--export=ALL",
         "--chdir=/tmp",
-        f"--output={run_root / 'logs' / 'slurm-%j-controller.log'}",
+        f"--output={run_root / 'logs' / 'slurm-%A_%a.log'}",
         str(repo / "cluster_jobs" / "run_cluster.sbatch"),
         str(run_root),
         str(int(total_events)),

@@ -1,6 +1,7 @@
 # TEMPO XRF cluster implementation and operations
 
-Last verified: 2026-10-02
+Last verified on the real cluster: 2026-10-02.
+Dynamic queue implementation validated locally: 2026-10-27.
 
 This document explains the cluster work added to TEMPO XRF, why each change was
 made, how a simulation now travels from the Streamlit UI through Slurm and
@@ -98,10 +99,10 @@ RoboAiXrfSimulation.start_run()
 cluster_jobs/ui_cluster_run.py
         |
         v
-sbatch: one exclusive allocation covering all selected nodes
+sbatch: one-node job array, throttled to selected-node count
         |
         v
-run_cluster.sbatch: one concurrent srun task per node
+run_cluster.sbatch: one array chunk on whichever selected node is free
         |
         v
 run_shard.sbatch: private macro, seeds, folder, and Geant4 process
@@ -116,9 +117,11 @@ combine_shards.py validates and merges successful shards
 complete merge is published as the run's simulation.root
 ```
 
-The implementation intentionally uses one Slurm allocation for the complete
-distributed run. Slurm therefore reserves the selected nodes together, and the
-controller launches one shard concurrently on each node.
+The distributed implementation uses a Slurm job array instead of reserving every
+node in one gang allocation. By default it creates four chunks per selected node
+and limits concurrent array elements to the number of selected nodes. Each array
+element requests one exclusive node. When a fast node completes, Slurm can place
+another pending chunk there; a slower node naturally completes fewer chunks.
 
 ### Node selection
 
@@ -156,25 +159,28 @@ records and validates each exact selected host.
 The UI provides:
 
 - **Single node**: choose one compute node; the same safe shard-and-merge path is
-  used with one shard.
+  used with one chunk by default.
 - **Distributed**: choose any number of nodes; all discovered nodes are selected
-  by default.
+  by default. **Queued chunks per node** defaults to four and accepts 1 through
+  32. The UI shows the resulting chunk count, approximate events per chunk, and
+  maximum concurrency before submission.
 
 ### Event splitting
 
 The UI's **Beam-on events** value is the total for the complete run, not the
 number per node.
 
-For `E` events and `N` shards, the launcher calculates `q, r = divmod(E, N)`.
-The first `r` shards receive `q + 1` events and the remaining shards receive
+For `E` events and `N` chunks, the launcher calculates `q, r = divmod(E, N)`.
+The first `r` chunks receive `q + 1` events and the remaining chunks receive
 `q`. This guarantees that:
 
 - every event is assigned exactly once;
 - the sum of shard events equals the requested total;
 - shard sizes differ by at most one event.
 
-If fewer events than nodes are requested, the number of used nodes is reduced so
-that no empty shard is created.
+The chunk count is `min(events, selected_nodes * chunks_per_node)`, so no empty
+chunk is created. More chunks improve load balancing, but chunks that finish in
+only a few seconds can lose throughput to Slurm and Geant4 startup overhead.
 
 ### Independent random seeds and folders
 
@@ -214,8 +220,8 @@ The frontend now labels this setting **Workers per node** and accepts 1 through
   allowed CPU list in its marker.
 - Every selected node is explicitly requested with `--mem=185000`, replacing
   the old 16 GiB request.
-- The allocation is exclusive, uses one task per selected node, and uses an
-  explicit node list.
+- Every array element is exclusive, uses one task on one selected node, and uses
+  the complete selected-node list as its placement allowlist.
 
 The eight-node smoke test observed 40 CPUs per shard with affinity `0-39` on the
 captured task logs. The 40-versus-80 benchmark successfully ran both allocation
@@ -252,7 +258,11 @@ and validates every success marker against the original plan:
 - seed pair;
 - zero exit status;
 - existence of `simulation.root`;
-- distinct node use.
+- execution on a selected node.
+
+Repeated node use is expected: it proves that completed nodes can pick up more
+queued work. The run manifest records a per-node summary of completed chunks,
+events, and cumulative Geant4 elapsed time.
 
 `cluster_jobs/combine_shards.py` reads only success-marked shard outputs. It
 merges the `MyTree` fields `EventId`, `rootId`, `Energy`, and `Weight` with
@@ -277,11 +287,12 @@ New shared configuration module containing:
 - explicit node parsing, validation, and deduplication;
 - future-node environment overrides;
 - exact event splitting;
+- configurable queue sizing and concurrency calculation;
 - independent seed generation;
 - worker validation;
 - 40/80 topology flags;
 - the fixed 185000 memory request;
-- construction of the complete `sbatch` command.
+- construction of the throttled one-node Slurm array command.
 
 ### `cluster_jobs/ui_cluster_run.py`
 
@@ -292,15 +303,17 @@ Replaced the fixed five-node launcher with the main distributed controller. It:
 - writes and updates `run_manifest.json` atomically;
 - submits and monitors Slurm;
 - aggregates progress from per-task logs;
-- validates markers and distinct nodes;
+- validates every planned chunk and allows selected nodes to be reused;
+- records per-node chunk, event, and elapsed-time totals;
 - invokes the safe merge;
 - publishes only complete results;
 - cancels the active Slurm job if the frontend process receives `SIGTERM`.
 
 ### `cluster_jobs/run_cluster.sbatch`
 
-This is the controller executed inside the allocation. It checks the expected
-task count and starts one `srun` shard task per selected node concurrently.
+This is the array-element controller executed inside each one-node allocation.
+It checks `SLURM_ARRAY_TASK_ID` and starts one CPU-bound `srun` chunk. The array
+throttle, not this script, limits the number running concurrently.
 
 The shared repository path is passed as an explicit argument. This is important
 because Slurm executes an `sbatch` script from `/var/spool/slurmd`; deriving the
@@ -321,10 +334,12 @@ is complete.
 
 ### `cluster_jobs/cluster_smoke_test.py`
 
-New real-cluster test command. It discovers or accepts nodes, requests a small
-number of events per node, runs through the production launcher without
-publishing over a user result, and verifies that every selected node completed
-exactly one distinct shard.
+Real-cluster test command. It discovers or accepts nodes, submits two queued
+chunks per selected node by default, runs through the production launcher
+without publishing over a user result, verifies all requested events, and prints
+the per-node chunk distribution. It does not require every selected node to run
+work because selected nodes may be unavailable and array chunks may reuse faster
+eligible nodes.
 
 ### `cluster_jobs/benchmark_workers.py`
 
@@ -344,6 +359,7 @@ reapplied.
 `RoboAiXrfSimulation.start_run()` now:
 
 - accepts an integer node count or explicit node sequence;
+- accepts and forwards the requested chunks per node;
 - validates 1 through 80 workers;
 - locates the repository safely;
 - launches `cluster_jobs/ui_cluster_run.py` instead of directly executing one
@@ -362,6 +378,8 @@ The Build & run page now:
 - caches inventory for 30 seconds;
 - displays Single node and Distributed modes;
 - allows a configurable node selection instead of a fixed five-node checkbox;
+- exposes **Queued chunks per node**, defaulting to four for Distributed mode;
+- shows calculated chunks, event size, and maximum concurrency;
 - defaults distributed selection to every discovered node;
 - displays the inventory source and any discovery warning;
 - labels the thread setting Workers per node and caps it at 80;
@@ -402,7 +420,7 @@ New guarded, selective deployment helper. It:
 
 ### `tests/test_cluster_jobs.py`
 
-Fourteen automated tests cover:
+Seventeen automated tests cover:
 
 - the complete eight-node fallback;
 - future nodes supplied through the environment;
@@ -412,14 +430,21 @@ Fourteen automated tests cover:
 - 40-worker physical-core allocation;
 - 80-worker hardware-thread allocation;
 - removal of the old 16 GiB request;
-- one task per selected node;
+- throttled job-array submission with one node per chunk;
+- queue sizing when chunks outnumber nodes or events are scarce;
 - explicit shared repository forwarding;
 - success-marker-only discovery;
 - macro validation;
 - shard macro rewriting and marker creation;
 - publication only after all shards validate;
+- repeated-node queue completion and per-node accounting;
 - retention but non-publication of partial merges;
 - the Slurm spool-path regression.
+
+`tests/__init__.py` makes the repository test directory a regular package. This
+prevents an unrelated `tests` package installed in the management virtualenv from
+shadowing it when the suite is invoked as `python -m unittest
+tests.test_cluster_jobs`.
 
 ### `AGENTS.md` and `docs/CLUSTER_CONTEXT.md`
 
@@ -529,8 +554,9 @@ failure verified the publication safety gate.
 
 ### Automated tests
 
-All 14 cluster tests passed on the laptop and again in the management virtual
-environment:
+The original 14 cluster tests passed on the laptop and in the management virtual
+environment. After the dynamic queue change, 17 tests pass locally; the updated
+suite still needs to be run on management:
 
 ```bash
 cd /srv/cluster/TEMPO_XRF_REPO
@@ -556,7 +582,10 @@ python_code/roboai_xrf_frontend/runs/full_xrf_example/cluster_runs/
 ```
 
 The smoke test intentionally uses `publish=False`, so it cannot overwrite a
-user's top-level result.
+user's top-level result. This was the pre-queue, one-shard-per-node smoke test.
+After deploying the array implementation, rerun the command in **Repeating
+validation**; it now submits two chunks per selected node and reports the actual
+per-node distribution.
 
 ### 40-versus-80 benchmark
 
@@ -636,13 +665,16 @@ Then open `http://localhost:8502`.
 6. Click **Save run settings**.
 7. Choose **Single node** for a test or **Distributed** and the desired nodes for
    production.
-8. Click **1. Build & compile**.
-9. Optionally use **2. Open visualization** to check geometry. A visualization
+8. For Distributed mode, leave **Queued chunks per node** at 4 initially. Check
+   the displayed chunk count and events per chunk; increase it only when chunks
+   remain long enough that startup overhead is small.
+9. Click **1. Build & compile**.
+10. Optionally use **2. Open visualization** to check geometry. A visualization
    is not a quantitative run.
-10. Click **3. Run Geant4** and leave the frontend process running.
-11. After success, open **Results**, enter acquisition and detector-response
+11. Click **3. Run Geant4** and leave the frontend process running.
+12. After success, open **Results**, enter acquisition and detector-response
     settings, and click **Apply detector response**.
-12. Inspect the spectrum, upload a comparison spectrum if desired, and download
+13. Inspect the spectrum, upload a comparison spectrum if desired, and download
     the CSV.
 
 Use a unique run name for each important experiment. Reusing a name preserves
@@ -672,13 +704,12 @@ Each `cluster_runs/<run-id>/` can contain:
 
 | Path | Purpose |
 |---|---|
-| `run_manifest.json` | Requested nodes, events, workers, seeds, Slurm command and final status |
+| `run_manifest.json` | Requested nodes, queue shape, events, workers, seeds, per-node summary, Slurm command and final status |
 | `config.json`, `run.mac` | Immutable run input snapshot |
 | `combined_response.root` | Merge of validated successful shards |
 | `combined_response.json` | Completeness, row counts and per-shard metadata |
-| `logs/slurm-*-controller.log` | Allocation/controller log |
-| `logs/slurm-*_<task>.log` | Per-node task logs |
-| `shard-N/simulation.root` | Independent shard ROOT output |
+| `logs/slurm-<array>_<chunk>.log` | Per-chunk array/controller/task log |
+| `shard-N/simulation.root` | Independent queued-chunk ROOT output |
 | `shard-N/success.json` | Valid success marker, node, seeds, affinity and timing |
 | `shard-N/failure.json` | Failure marker and timing when execution failed |
 
@@ -756,6 +787,7 @@ python -m unittest -v tests.test_cluster_jobs
 python cluster_jobs/cluster_smoke_test.py \
   python_code/roboai_xrf_frontend/runs/full_xrf_example \
   --events-per-node 100 \
+  --chunks-per-node 2 \
   --workers 40
 ```
 
@@ -791,6 +823,12 @@ python cluster_jobs/benchmark_workers.py \
 - The current benchmark clearly favors 80 workers for the tested workload, but
   a longer benchmark is advisable if the event physics or output density changes
   substantially.
+- Four chunks per node is an initial balancing setting. Very small chunks can
+  reduce throughput because every chunk initializes Geant4 and creates a ROOT
+  file. Measure representative 1, 2, 4, and 8 chunk-per-node runs before changing
+  the production default.
+- The dynamic job-array path has local automated coverage but still requires its
+  first real management smoke test after selective deployment.
 - Keep all nodes provisioned consistently, including the EPEL Xerces runtime.
 - Keep `mnode-01` resolvable locally through `/etc/hosts`; Slurm client commands
   should not depend on external DNS.

@@ -6,7 +6,7 @@ total=$2
 workers=$3
 shards=$4
 seed_base=$5
-id=${SLURM_PROCID:?SLURM_PROCID is required}
+id=${6:-${SLURM_ARRAY_TASK_ID:-${SLURM_PROCID:?A shard ID is required}}}
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 if [[ ${SLURM_CPUS_PER_TASK:-0} -ne $workers ]]; then
@@ -21,6 +21,7 @@ failure="$out/failure.json"
 
 # Geant4 also writes viewer files relative to the process working directory.
 mkdir -p "$out/work/launch" "$out/roboaixrf/vis/public"
+rm -f "$success" "$failure" "$out/simulation.root"
 cp "$root/config.json" "$out/config.json"
 
 seed1=$((seed_base + id * 2))

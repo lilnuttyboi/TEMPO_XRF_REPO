@@ -1,6 +1,6 @@
 # TEMPO XRF cluster context
 
-Last updated: 2026-10-02
+Last updated: 2026-10-27
 
 Read this file before changing the frontend-to-cluster execution path. Keep it
 current when cluster behavior, deployment paths, or verified assumptions change.
@@ -17,13 +17,15 @@ The quantitative-run path is:
 2. `roboaixrf/main.py` writes `run.mac`, removes an older published
    `simulation.root`, and starts `cluster_jobs/ui_cluster_run.py`.
 3. The cluster controller creates an immutable run directory below the compiled
-   frontend run and submits `cluster_jobs/run_cluster.sbatch` as one gang-scheduled
-   allocation covering every selected node. The controller passes the shared
-   repository path explicitly because Slurm executes a spool copy of the batch
-   script; deriving the repository from the batch script's `BASH_SOURCE` is invalid.
-4. `run_cluster.sbatch` starts one concurrent `run_shard.sbatch` task per node.
-   Each shard has its own folder, event count, random seeds, macro,
-   viewer-output path, and `simulation.root`.
+   frontend run and submits `cluster_jobs/run_cluster.sbatch` as a throttled Slurm
+   job array. Distributed UI runs default to four queued chunks per selected node;
+   the array concurrency limit equals the selected-node count. Each array element
+   requests one exclusive node, so a node that finishes can receive the next
+   pending chunk instead of waiting for the slowest original assignment.
+4. Each array element starts one `run_shard.sbatch` process. Every chunk has its
+   own folder, event count, random seeds, macro, viewer-output path, and
+   `simulation.root`. The shared repository path is passed explicitly because
+   Slurm executes a spool copy of the batch script.
 5. `geant4_code/build/sim` reads the shard config/macro. The macro controls
    `/run/numberOfThreads`, `/random/setSeeds`, and `/run/beamOn`.
 6. A shard writes `success.json` only after Geant4 exits zero and its ROOT output
@@ -38,8 +40,11 @@ The quantitative-run path is:
 
 - Management/login host: `mnode@mnode-01` (`192.168.10.3`).
 - Shared repository: `/srv/cluster/TEMPO_XRF_REPO`, previously branch `front`.
-- Debug-partition compute nodes: `node-01-[001-004]` and
-  `node-02-[001-004]` (eight total).
+- The original verified compute set was `node-01-[001-004]` and
+  `node-02-[001-004]` (eight total). Slurm later reported 20 registered names,
+  through `node-05-004`; only `node-01-[001-004]` were `IDLE` in that later
+  snapshot and the remaining nodes were `DOWN`/`DOWN*`. Live discovery includes
+  registered nodes regardless of state, so readiness still requires `sinfo`.
 - Each node: 40 physical cores, 80 logical CPUs with Hyper-Threading, and
   191544 MiB reported to Slurm. Reported topology is two sockets, 20 physical
   cores per socket, and two hardware threads per core.
@@ -57,10 +62,11 @@ The quantitative-run path is:
 - Verified management virtualenv: `/srv/cluster/TEMPO_XRF_REPO/.venv`
   (Python 3.11).
 
-## Laptop verification on 2026-10-02
+## Laptop verification
 
-The laptop is on `front` at `a623fc9`, matching `origin/front`, with pre-existing
-modified and untracked cluster work. The custom files are present locally:
+The cluster implementation was saved locally as commit `f5217f5` on branch
+`cluster-eight-node-2026-10-12`, based on upstream `front` commit `a623fc9`.
+The custom files are present locally:
 
 - `cluster_jobs/ui_cluster_run.py`
 - `cluster_jobs/run_shard.sbatch`
@@ -72,6 +78,14 @@ modified and untracked cluster work. The custom files are present locally:
 
 Historical five-shard run directories and logs are also present locally and show
 successful runs on the shared `/srv/cluster/TEMPO_XRF_REPO` path.
+
+On 2026-10-27, `origin/front` was fetched and had advanced to `ebabe36`. Its eight
+new commits add only `final_fcking_setup_istg.sh`, `python_code/script.py`, and
+`requirement.txt`; they do not overlap the saved cluster commit. The new installer
+targets an online, full-machine rebuild under `$HOME`, defaults to branch
+`new_geant4`, and includes a Geant4 null-secondary source patch. It must not be
+blindly merged into the working NFS cluster installation. No upstream runtime or
+cluster change needs to be ported for the queue work.
 
 Direct comparison with management is **not yet verified**. The host was reachable,
 but both laptop SSH keys were rejected for `mnode`; non-interactive SSH ended with
@@ -182,13 +196,18 @@ closes the original eight-node execution and Xerces failure reproduction loop.
 
 ## Outstanding uncertainties
 
-- The exact node topology and Slurm CPU-binding result for 40 versus 80 workers
-  must be captured from a real allocation.
 - The active `roboaixrf` module may resolve inside the management virtualenv and
   may contain edits not present in this checkout. Inspect `roboaixrf.__file__`
   and diff it before deployment; do not overwrite an unverified virtualenv copy.
-- Maximum throughput at 40 versus 80 workers is a measurement question. Use the
-  checked-in paired benchmark and record its JSON result here after it is run.
+- The management checkout was reported as being restored after an accidental
+  replacement, but its final commit/file parity with this laptop branch has not
+  been re-verified.
+- The Slurm job-array queue is locally implemented and tested but has not yet had
+  a live management smoke test. Confirm array scheduling, repeated-node work
+  pickup, NFS markers, and complete merging before production use.
+- Four chunks per node is the approved starting point, not a universal optimum.
+  Production chunks should ideally run for tens of seconds to several minutes;
+  compare queue sizes with a representative simulation after deployment.
 - Management's original Python environment is no longer available at its
   reported path. The current `/home/mnode/TEMPO_XRF_REPO/.venv` is an incomplete
   root-owned copy of the laptop Python 3.14 venv: it contains `pip3.14` but no
@@ -202,6 +221,16 @@ closes the original eight-node execution and Xerces failure reproduction loop.
   `/srv/cluster/TEMPO_XRF_REPO` also passed its complete offline preflight using
   the shared Geant4 setup and this venv.
 
+The first post-queue validation attempt on management could run the integration
+verifier but `python -m unittest -v tests.test_cluster_jobs` imported a different
+top-level `tests` package from the virtualenv and reported that the repository
+test module did not exist. The repository's `tests/` directory had no
+`__init__.py`, so it was only a namespace-package candidate and could be shadowed
+by a regular installed package. `tests/__init__.py` is now source controlled and
+included in selective deployment. Until that one file is deployed, run the suite
+directly with `PYTHONPATH=/srv/cluster/TEMPO_XRF_REPO python
+tests/test_cluster_jobs.py -v`.
+
 ## Implemented cluster behavior
 
 - The UI discovers expanded node names from the `debug` partition with `sinfo`.
@@ -213,10 +242,12 @@ closes the original eight-node execution and Xerces failure reproduction loop.
   dependencies, CPU topology, and memory with a targeted smoke test before
   selecting it for production.
 - Single-node and distributed modes both use the same validated controller path.
-- A distributed job requests all selected nodes together with one task per node,
-  so shards start concurrently on distinct nodes rather than relying on array-job
-  placement.
-- For `N` shards, shard `i` receives
+- A distributed run creates `selected_nodes * chunks_per_node` chunks, limited by
+  the event count. The UI default is four chunks per node. Slurm receives a
+  one-node job array with `%selected_nodes` throttling, so at most one full-node
+  chunk runs per selected node at once and newly free nodes take pending chunks.
+  Single-node UI runs use one chunk by default.
+- For `N` chunks, chunk `i` receives
   `total // N + (i < total % N)` events. No zero-event shards are created.
 - Each shard receives a unique adjacent seed pair derived from a recorded seed
   base. Benchmark pairs reuse the same seed base for 40 and 80 workers.
@@ -225,6 +256,12 @@ closes the original eight-node execution and Xerces failure reproduction loop.
   workers and Slurm `--cpus-per-task` are identical. The `srun` step applies
   `--cpu-bind=verbose,threads`, and each marker records its observed Linux CPU
   affinity.
+- Repeated node names in successful markers are expected. `run_manifest.json`
+  records `chunk_count`, `max_concurrent_chunks`, the execution node for every
+  chunk, and a `node_summary` containing per-node chunk/event/timing totals.
+- Every chunk must validate before the merged result is published. A failed or
+  missing chunk still permits a diagnostic merge of successful outputs inside
+  the timestamped run directory, never publication as the UI result.
 - `cluster_jobs/patch_ui.py` is now an idempotent integration verifier. It can no
   longer reapply the obsolete five-node/16-GiB patch.
 
@@ -238,7 +275,7 @@ count, which supports paired 40/80 comparisons with the same starting seed:
 
 ## Local validation
 
-Validated on the laptop on 2026-10-02:
+Validated on the laptop on 2026-10-27:
 
 ```bash
 python3 -m unittest -v tests.test_cluster_jobs
@@ -248,12 +285,13 @@ bash -n cluster_jobs/run_cluster.sbatch cluster_jobs/run_shard.sbatch
 git diff --check
 ```
 
-All 14 unit/integration tests passed. The tests cover eight-node fallback and
+All 17 unit/integration tests passed. The tests cover eight-node fallback and
 future-node override discovery, exact event division, independent seeds,
-40/80 CPU and memory flags, one-task-per-node submission, success-marker gating,
-an end-to-end shard macro rewrite with a fake simulator, and execution of the
-controller from a simulated Slurm spool path. This laptop has no Slurm client, so
-a real allocation still requires management.
+40/80 CPU and memory flags, throttled job-array submission, repeated-node queue
+completion, per-node accounting, success-marker gating, an end-to-end shard macro
+rewrite with a fake simulator, and execution of the controller from a simulated
+Slurm spool path. This laptop has no Slurm client, so a real array allocation
+still requires management.
 
 The same 14-test suite passed under the clean Python 3.11 management venv after
 the explicit shared-repository argument fix was selectively deployed. This
@@ -324,6 +362,7 @@ rsync -av --itemize-changes --dry-run --relative -e 'ssh -F /dev/null' \
   ./roboaixrf/main.py \
   ./python_code/roboai_xrf_frontend/components/run_page.py \
   ./python_code/roboai_xrf_frontend/requirements.txt \
+  ./tests/__init__.py \
   ./tests/test_cluster_jobs.py \
   mnode@192.168.10.3:/srv/cluster/TEMPO_XRF_REPO/
 ```
@@ -410,12 +449,13 @@ If it is managed by systemd, first identify the existing unit with
 `PYTHONPATH` to that unit's environment, then restart that existing unit. Do not
 invent a new unit or overwrite the virtualenv package.
 
-## Eight-node smoke test
+## Dynamic-queue smoke test
 
 Use a frontend run directory that already contains compiled `config.json` and
-`run.mac`. The smoke test discovers all current `debug` nodes, requests them in a
-single allocation, runs 100 events per node with 40 workers, refuses partial
-publication, and verifies that every selected node produced one successful shard:
+`run.mac`. The smoke test discovers all current `debug` nodes, creates two queued
+chunks per selected node, runs 100 total events per selected node with 40 workers,
+refuses partial publication, verifies the complete event count, and prints how
+many chunks each eligible node actually processed:
 
 ```bash
 cd /srv/cluster/TEMPO_XRF_REPO
@@ -423,12 +463,14 @@ source /srv/cluster/TEMPO_XRF_REPO/.venv/bin/activate
 export PYTHONPATH=/srv/cluster/TEMPO_XRF_REPO${PYTHONPATH:+:$PYTHONPATH}
 python cluster_jobs/cluster_smoke_test.py \
   python_code/roboai_xrf_frontend/runs/full_xrf_example \
-  --events-per-node 100 --workers 40
+  --events-per-node 100 --chunks-per-node 2 --workers 40
 ```
 
-The command prints the artifact directory. Inspect `run_manifest.json`,
-`combined_response.json`, and each `logs/slurm-<job>_<task>.log`; the first shard
-line records node, event count, worker count, allocated CPUs, affinity, and seeds.
+The command prints the artifact directory and `node_summary`. Inspect
+`run_manifest.json`, `combined_response.json`, and each
+`logs/slurm-<array>_<chunk>.log`; the first chunk line records node, event count,
+worker count, allocated CPUs, affinity, and seeds. This new array test is still
+outstanding on management.
 
 ## Repeatable 40-versus-80 benchmark
 

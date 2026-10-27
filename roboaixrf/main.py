@@ -489,6 +489,7 @@ class RoboAiXrfSimulation(BaseModel):
         number_of_thread: int,
         show_progress_terminal: bool = False,
         cluster_nodes: int | str | Sequence[str] = 1,
+        cluster_chunks_per_node: int = 1,
     ) -> subprocess.Popen:
         
         self._run_done.clear()
@@ -501,6 +502,9 @@ class RoboAiXrfSimulation(BaseModel):
         workers = int(number_of_thread)
         if not 1 <= workers <= 80:
             raise ValueError("number_of_thread must be between 1 and 80 on the cluster.")
+        chunks_per_node = int(cluster_chunks_per_node)
+        if chunks_per_node < 1:
+            raise ValueError("cluster_chunks_per_node must be at least 1.")
 
         print_display = max(
             1,
@@ -549,6 +553,8 @@ class RoboAiXrfSimulation(BaseModel):
             str(self.config_path.resolve()),
             str(int(beam_on)),
             str(workers),
+            "--chunks-per-node",
+            str(chunks_per_node),
         ]
         if isinstance(cluster_nodes, int):
             if cluster_nodes < 1:

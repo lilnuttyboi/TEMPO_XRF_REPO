@@ -14,7 +14,7 @@ REPO_PATH = Path(__file__).resolve().parents[3]
 if str(REPO_PATH) not in sys.path:
     sys.path.append(str(REPO_PATH))
 
-from cluster_jobs.cluster_config import discover_nodes
+from cluster_jobs.cluster_config import calculate_queue_shape, discover_nodes
 from components.common import page_header
 from state import (
     configuration_fingerprint,
@@ -290,6 +290,7 @@ def render_run_page():
                 key="single_cluster_node",
             )
         ]
+        chunks_per_node = 1
     else:
         selected_nodes = st.multiselect(
             "Compute nodes",
@@ -297,14 +298,46 @@ def render_run_page():
             default=list(node_options),
             key="distributed_cluster_nodes",
             help=(
-                "One concurrent shard is assigned to each selected node. "
-                "The list is refreshed from Slurm, so newly added nodes appear here."
+                "Queued chunks can run on any selected node. Faster nodes take "
+                "more chunks as they become free. The list is refreshed from Slurm."
             ),
+        )
+        chunks_per_node = int(
+            st.number_input(
+                "Queued chunks per node",
+                min_value=1,
+                max_value=32,
+                value=4,
+                step=1,
+                key="cluster_chunks_per_node",
+                help=(
+                    "Four is the recommended starting point. More chunks improve "
+                    "load balancing, but very short chunks add Slurm and Geant4 "
+                    "startup overhead."
+                ),
+            )
         )
     st.caption(
         f"Node inventory: {inventory_source}. "
         f"Workers per selected node: {int(run['number_of_thread'])}."
     )
+    if selected_nodes:
+        chunk_count, max_concurrent = calculate_queue_shape(
+            int(run["beam_on"]),
+            len(selected_nodes),
+            chunks_per_node,
+        )
+        smallest_chunk, extra = divmod(int(run["beam_on"]), chunk_count)
+        largest_chunk = smallest_chunk + (1 if extra else 0)
+        chunk_size = (
+            str(smallest_chunk)
+            if smallest_chunk == largest_chunk
+            else f"{smallest_chunk}-{largest_chunk}"
+        )
+        st.caption(
+            f"Queue: {chunk_count} chunks of about {chunk_size} events; "
+            f"up to {max_concurrent} run at once."
+        )
     if inventory_warning:
         st.caption(inventory_warning)
 
@@ -498,6 +531,7 @@ def render_run_page():
                     run["number_of_thread"]
                 ),
                 cluster_nodes=selected_nodes,
+                cluster_chunks_per_node=chunks_per_node,
             )
             st.session_state.geant4_started_at = time.time()
 

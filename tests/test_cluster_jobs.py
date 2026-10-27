@@ -13,6 +13,7 @@ from cluster_jobs.cluster_config import (
     DEFAULT_NODES,
     MEMORY_MIB_PER_NODE,
     build_sbatch_command,
+    calculate_queue_shape,
     discover_nodes,
     parse_node_list,
     seed_pairs,
@@ -78,7 +79,11 @@ class ClusterConfigTests(unittest.TestCase):
         self.assertNotIn("--mem=16G", args)
         self.assertFalse(any(item.startswith("--threads-per-core") for item in args))
 
-    def test_sbatch_requests_one_task_per_selected_node(self):
+    def test_queue_shape_creates_multiple_chunks_per_node(self):
+        self.assertEqual(calculate_queue_shape(803, 8, 4), (32, 8))
+        self.assertEqual(calculate_queue_shape(3, 8, 4), (3, 3))
+
+    def test_sbatch_uses_a_throttled_one_node_job_array(self):
         command = build_sbatch_command(
             repo=Path("/srv/cluster/TEMPO_XRF_REPO"),
             run_root=Path("/srv/cluster/run"),
@@ -86,16 +91,25 @@ class ClusterConfigTests(unittest.TestCase):
             workers=80,
             nodes=DEFAULT_NODES,
             seed_base=123_456,
+            chunks_per_node=4,
         )
-        self.assertIn("--nodes=8", command)
-        self.assertIn("--ntasks=8", command)
+        self.assertIn("--nodes=1", command)
+        self.assertIn("--ntasks=1", command)
         self.assertIn("--ntasks-per-node=1", command)
         self.assertIn("--exclusive", command)
+        self.assertIn("--array=0-31%8", command)
         self.assertIn(f"--nodelist={','.join(DEFAULT_NODES)}", command)
+        self.assertIn("--output=/srv/cluster/run/logs/slurm-%A_%a.log", command)
         self.assertEqual(command[-1], "/srv/cluster/TEMPO_XRF_REPO")
 
 
 class LauncherTests(unittest.TestCase):
+    def test_deployment_includes_a_real_tests_package(self):
+        repo = Path(__file__).parents[1]
+        self.assertTrue((repo / "tests" / "__init__.py").is_file())
+        deployment = (repo / "deploy_to_mnode.sh").read_text(encoding="utf-8")
+        self.assertIn("./tests/__init__.py", deployment)
+
     def test_shared_repo_venv_is_preferred_over_stale_home_copy(self):
         source_script = Path(__file__).parents[1] / "start_tempo_xrf.sh"
         with tempfile.TemporaryDirectory() as temporary:
@@ -245,7 +259,8 @@ class ControllerScriptTests(unittest.TestCase):
             shard_script.parent.mkdir(parents=True)
             shard_script.write_text(
                 "#!/usr/bin/env bash\n"
-                "printf '%s\\n' \"${BASH_SOURCE[0]}\" > \"$TEMPO_TEST_OUTPUT\"\n",
+                "printf '%s|%s\\n' \"${BASH_SOURCE[0]}\" \"${6:-}\" "
+                "> \"$TEMPO_TEST_OUTPUT\"\n",
                 encoding="utf-8",
             )
 
@@ -276,6 +291,7 @@ class ControllerScriptTests(unittest.TestCase):
                     "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
                     "SLURM_NTASKS": "1",
                     "SLURM_JOB_ID": "123",
+                    "SLURM_ARRAY_TASK_ID": "0",
                     "SLURM_JOB_NODELIST": "node-01-001",
                     "TEMPO_TEST_OUTPUT": str(output),
                 }
@@ -298,13 +314,13 @@ class ControllerScriptTests(unittest.TestCase):
                 env=environment,
             )
 
-            self.assertEqual(
-                Path(output.read_text(encoding="utf-8").strip()), shard_script
-            )
+            launched_script, chunk_id = output.read_text(encoding="utf-8").strip().split("|")
+            self.assertEqual(Path(launched_script), shard_script)
+            self.assertEqual(chunk_id, "0")
 
 
 class RunnerTests(unittest.TestCase):
-    def test_controller_publishes_only_after_all_markers_validate(self):
+    def test_controller_accepts_reused_nodes_and_records_queue_distribution(self):
         with tempfile.TemporaryDirectory() as temporary:
             config_dir = Path(temporary) / "compiled"
             config_dir.mkdir()
@@ -323,8 +339,13 @@ class RunnerTests(unittest.TestCase):
                 if command[0] == "squeue":
                     if not markers_written:
                         run_root = next((config_dir / "cluster_runs").iterdir())
-                        for shard_id, (events, seeds) in enumerate(
-                            ((3, [1000, 1001]), (2, [1002, 1003]))
+                        for shard_id, (events, seeds, node) in enumerate(
+                            (
+                                (3, [1000, 1001], nodes[0]),
+                                (2, [1002, 1003], nodes[1]),
+                                (2, [1004, 1005], nodes[0]),
+                                (2, [1006, 1007], nodes[1]),
+                            )
                         ):
                             folder = run_root / f"shard-{shard_id}"
                             folder.mkdir()
@@ -333,7 +354,7 @@ class RunnerTests(unittest.TestCase):
                                 json.dumps(
                                     {
                                         "id": shard_id,
-                                        "node": nodes[shard_id],
+                                        "node": node,
                                         "events": events,
                                         "workers": 40,
                                         "affinity": "0-39",
@@ -357,15 +378,33 @@ class RunnerTests(unittest.TestCase):
             ):
                 manifest = run_cluster(
                     config_dir=config_dir,
-                    total_events=5,
+                    total_events=9,
                     workers=40,
                     nodes=nodes,
                     seed_base=1000,
+                    chunks_per_node=2,
                 )
 
             self.assertEqual(manifest["status"], "complete")
-            self.assertEqual(manifest["event_counts"], [3, 2])
-            self.assertEqual(manifest["actual_nodes"], list(nodes))
+            self.assertEqual(manifest["event_counts"], [3, 2, 2, 2])
+            self.assertEqual(manifest["actual_nodes"], [nodes[0], nodes[1]] * 2)
+            self.assertEqual(manifest["chunk_count"], 4)
+            self.assertEqual(manifest["max_concurrent_chunks"], 2)
+            self.assertEqual(
+                manifest["node_summary"],
+                {
+                    nodes[0]: {
+                        "chunks": 2,
+                        "events": 5,
+                        "elapsed_ns": 2_000_000,
+                    },
+                    nodes[1]: {
+                        "chunks": 2,
+                        "events": 4,
+                        "elapsed_ns": 2_000_000,
+                    },
+                },
+            )
             self.assertEqual((config_dir / "simulation.root").read_bytes(), b"combined")
             self.assertIn("--mem=185000", manifest["sbatch_command"])
 

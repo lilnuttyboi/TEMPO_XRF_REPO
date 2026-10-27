@@ -51,6 +51,7 @@ rsync "${RSYNC_OPTIONS[@]}" -e 'ssh -F /dev/null' \
     ./roboaixrf/main.py \
     ./python_code/roboai_xrf_frontend/components/run_page.py \
     ./python_code/roboai_xrf_frontend/requirements.txt \
+    ./tests/__init__.py \
     ./tests/test_cluster_jobs.py \
     "$TARGET"
 
