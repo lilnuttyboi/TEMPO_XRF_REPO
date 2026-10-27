@@ -19,8 +19,10 @@ The quantitative-run path is:
 3. The cluster controller creates an immutable run directory below the compiled
    frontend run and submits `cluster_jobs/run_cluster.sbatch` as a throttled Slurm
    job array. Distributed UI runs automatically recommend chunks per selected
-   node from the saved event total, selected-node count, worker count, and measured
-   cluster throughput; a 1--32 manual override remains available. The array
+   node from the saved event total, selected-node count, worker count, and
+   representative timing from matching completed runs. A conservative fallback
+   is used until such a run exists; Automatic is capped at eight chunks per node,
+   while a 1--32 manual override remains available. The array
    concurrency limit equals the selected-node count. Each array element requests
    one exclusive node, so a node that finishes can receive the next pending chunk
    instead of waiting for the slowest original assignment.
@@ -239,10 +241,20 @@ closes the original eight-node execution and Xerces failure reproduction loop.
   clean side-by-side checkout and the selectively merged production checkout.
   Restarting the production UI and submitting one small UI-driven queue run are
   the remaining operational checks.
-- Automatic queue sizing uses the measured full-XRF 40/80-worker rates and a
-  30-second target, but other geometry and physics configurations may differ.
-  Compare the recommendation with representative production measurements and
-  use Manual mode when the estimate is not representative.
+- A user-reported one-billion-event production run completed at approximately
+  5,477,872.86 events/s end to end (briefly about 6 million events/s), or roughly
+  183 seconds. It used a UI value of four chunks and was reported slightly slower
+  than the pre-queue implementation. The exact manifest, selected node count,
+  per-chunk times, and node distribution are still awaiting inspection. Do not
+  declare four optimal until the 1/2/4/8 benchmark is run.
+- The first Automatic implementation used the short 100,000-event 40/80 worker
+  benchmark as an absolute production throughput calibration. That benchmark
+  was startup-dominated and would have capped a one-billion-event run at 32
+  chunks per node (640 chunks on 20 nodes), repeating too much Geant4/ROOT/NFS
+  overhead. That calibration must not be deployed. The corrected implementation
+  learns only from matching completed runs whose median chunk lasts at least 15
+  seconds, targets about 60 seconds per chunk, and caps Automatic at eight chunks
+  per node. Manual still permits 1--32 for controlled benchmarks.
 - Management's original Python environment is no longer available at its
   reported path. The current `/home/mnode/TEMPO_XRF_REPO/.venv` is an incomplete
   root-owned copy of the laptop Python 3.14 venv: it contains `pip3.14` but no
@@ -278,11 +290,14 @@ tests/test_cluster_jobs.py -v`.
   selecting it for production.
 - Single-node and distributed modes both use the same validated controller path.
 - A distributed run creates `selected_nodes * chunks_per_node` chunks, limited by
-  the event count. Automatic mode estimates per-node throughput by scaling to the
-  measured 22568.57 events/s at 40 workers and interpolating up to 28557.48
-  events/s at 80 workers. It targets approximately 30 seconds per chunk and
-  returns 1--32 chunks per selected node. Manual mode can override that value
-  within the same bounds. Slurm receives a one-node job array with
+  the event count. Automatic mode scans this compiled run's history for up to
+  three recent complete runs with the same `config.json` and worker count. It
+  accepts them only when every chunk has a valid marker and the median chunk is
+  at least 15 seconds, then calculates event-weighted per-node throughput. Until
+  a matching long run exists, it uses a conservative production-scale fallback
+  of 217,000 events/s at 40 workers and 274,000 at 80. It targets approximately
+  60 seconds per chunk and returns 1--8 chunks per selected node. Manual mode can
+  override that value from 1--32. Slurm receives a one-node job array with
   `%selected_nodes` throttling, so at most one full-node chunk runs per selected
   node at once and newly free nodes take pending chunks. Single-node UI runs use
   one chunk by default.
@@ -302,7 +317,9 @@ tests/test_cluster_jobs.py -v`.
   affinity.
 - Repeated node names in successful markers are expected. `run_manifest.json`
   records `chunk_count`, `max_concurrent_chunks`, the execution node for every
-  chunk, and a `node_summary` containing per-node chunk/event/timing totals.
+  chunk, a `node_summary` containing per-node chunk/event/timing totals, the
+  copied-config hash, Slurm queue/execution time, merge time, and complete
+  controller wall time.
 - Every chunk must validate before the merged result is published. A failed or
   missing chunk still permits a diagnostic merge of successful outputs inside
   the timestamped run directory, never publication as the UI result.
@@ -329,12 +346,13 @@ bash -n cluster_jobs/run_cluster.sbatch cluster_jobs/run_shard.sbatch
 git diff --check
 ```
 
-All 19 unit/integration tests passed. The tests cover eight-node fallback and
-future-node override discovery, exact event division, measured-throughput chunk
-recommendations and bounds, independent seeds, 40/80 CPU and memory flags,
-throttled job-array submission, repeated-node queue completion, per-node
-accounting, success-marker gating, an end-to-end shard macro rewrite with a fake
-simulator, and execution of the controller from a simulated Slurm spool path.
+All 22 unit/integration tests passed. The tests cover eight-node fallback and
+future-node override discovery, exact event division, adaptive-throughput chunk
+recommendations and bounds, representative-history filtering, benchmark-list
+validation, independent seeds, 40/80 CPU and memory flags, throttled job-array
+submission, repeated-node queue completion, per-node accounting, success-marker
+gating, an end-to-end shard macro rewrite with a fake simulator, and execution
+of the controller from a simulated Slurm spool path.
 This laptop has no Slurm client, so the real array allocation was validated on
 management as recorded below.
 
@@ -590,3 +608,38 @@ Use 80 workers for maximum measured throughput on this hardware; retain 40 as th
 physical-core-only option. Each 100000-event run lasted only a few seconds, so a
 larger-event confirmation is advisable if long-production-run performance must
 be characterised independently of initialization and ROOT-output overhead.
+
+## Repeatable queue-depth benchmark
+
+`cluster_jobs/benchmark_chunks.py` compares 1, 2, 4, and 8 chunks per selected
+node on the same compiled configuration, nodes, workers, event count, and paired
+seed base. It measures end-to-end controller time, including Slurm waiting,
+Geant4, validation, and merging, because that is the throughput visible to the
+user. With two repetitions it reverses the order in the second pass to reduce
+temperature, cache, or cluster-drift bias. It never publishes over the current
+top-level result.
+
+For the production workload, first run one repetition at the normal one-billion
+event total while the selected nodes are otherwise idle:
+
+```bash
+cd /srv/cluster/TEMPO_XRF_REPO
+source .venv/bin/activate
+export PYTHONPATH=/srv/cluster/TEMPO_XRF_REPO
+python cluster_jobs/benchmark_chunks.py \
+  python_code/roboai_xrf_frontend/runs/full_xrf_example \
+  --events 1000000000 --workers 80 --chunks 1,2,4,8 --repetitions 1
+```
+
+This is expected to take roughly four production runs (about 12 minutes if the
+reported three-minute time remains stable). Use `--nodes` to reproduce an exact
+UI selection. The script writes every job ID, artifact path, node distribution,
+Geant4 node-seconds, end-to-end rate, medians, and the winner under
+`<config_dir>/benchmarks/*_chunks.json`. Run a second alternating repetition only
+if the first-place margin is small or results are noisy.
+
+The user's reported 5,477,872.86 events/s is consistent with 182.6 seconds for
+one billion events. It is evidence that the old 100,000-event calibration cannot
+predict production chunk duration, but it is not yet enough to identify whether
+1, 2, 4, or 8 chunks per node maximizes throughput. Inspect the corresponding
+manifest and run this benchmark before changing the measured default.

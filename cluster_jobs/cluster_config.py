@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import math
 import os
 from pathlib import Path
 import re
+import statistics
 import subprocess
 from typing import Iterable, Sequence
 
@@ -20,10 +23,16 @@ DEFAULT_PARTITION = "debug"
 MEMORY_MIB_PER_NODE = 185_000
 PHYSICAL_CORES_PER_NODE = 40
 LOGICAL_CPUS_PER_NODE = 80
-MEASURED_EVENTS_PER_SECOND_40 = 22_568.57
-MEASURED_EVENTS_PER_SECOND_80 = 28_557.48
-RECOMMENDED_CHUNK_SECONDS = 30.0
+# Conservative fallback for a production-sized full-XRF run. Automatic mode
+# replaces this with timing from matching completed runs whenever possible.
+# The earlier 100,000-event benchmark is deliberately not used here because
+# its per-node rate was dominated by Geant4 startup time.
+FALLBACK_EVENTS_PER_SECOND_40 = 217_000.0
+FALLBACK_EVENTS_PER_SECOND_80 = 274_000.0
+RECOMMENDED_CHUNK_SECONDS = 60.0
+MAX_AUTOMATIC_CHUNKS_PER_NODE = 8
 MAX_CHUNKS_PER_NODE = 32
+MIN_CALIBRATION_CHUNK_SECONDS = 15.0
 NODE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -32,6 +41,15 @@ class NodeInventory:
     nodes: tuple[str, ...]
     source: str
     warning: str | None = None
+
+
+@dataclass(frozen=True)
+class ThroughputCalibration:
+    events_per_second: float
+    run_count: int
+    chunk_count: int
+    median_chunk_seconds: float
+    source: str
 
 
 def _deduplicate(items: Iterable[str]) -> tuple[str, ...]:
@@ -126,18 +144,119 @@ def validate_chunks_per_node(chunks_per_node: int) -> int:
 
 
 def estimate_node_throughput(workers: int) -> float:
-    """Estimate events/s from the measured 40/80-worker cluster benchmark."""
+    """Return a conservative per-node fallback for queue-size previews."""
     workers = validate_workers(workers)
     if workers <= PHYSICAL_CORES_PER_NODE:
-        return MEASURED_EVENTS_PER_SECOND_40 * (
+        return FALLBACK_EVENTS_PER_SECOND_40 * (
             workers / PHYSICAL_CORES_PER_NODE
         )
 
     logical_fraction = (
         workers - PHYSICAL_CORES_PER_NODE
     ) / PHYSICAL_CORES_PER_NODE
-    return MEASURED_EVENTS_PER_SECOND_40 + logical_fraction * (
-        MEASURED_EVENTS_PER_SECOND_80 - MEASURED_EVENTS_PER_SECOND_40
+    return FALLBACK_EVENTS_PER_SECOND_40 + logical_fraction * (
+        FALLBACK_EVENTS_PER_SECOND_80 - FALLBACK_EVENTS_PER_SECOND_40
+    )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_throughput_calibration(
+    config_dir: Path,
+    workers: int,
+    *,
+    minimum_chunk_seconds: float = MIN_CALIBRATION_CHUNK_SECONDS,
+    max_runs: int = 3,
+) -> ThroughputCalibration | None:
+    """Measure per-node throughput from matching, representative completed runs.
+
+    The copied ``config.json`` must match byte-for-byte, every queued chunk must
+    have succeeded, and the median chunk must be long enough that startup does
+    not dominate. Up to the three newest qualifying runs are combined using
+    event-weighted Geant4 time.
+    """
+    config_dir = Path(config_dir).resolve()
+    workers = validate_workers(workers)
+    if not math.isfinite(minimum_chunk_seconds) or minimum_chunk_seconds <= 0:
+        raise ValueError("minimum_chunk_seconds must be finite and greater than 0.")
+    if max_runs < 1:
+        raise ValueError("max_runs must be at least 1.")
+
+    current_config = config_dir / "config.json"
+    cluster_runs = config_dir / "cluster_runs"
+    if not current_config.is_file() or not cluster_runs.is_dir():
+        return None
+    current_hash = _sha256(current_config)
+
+    manifests = sorted(
+        cluster_runs.glob("*/run_manifest.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    total_events = 0
+    total_elapsed_seconds = 0.0
+    durations: list[float] = []
+    qualifying_runs = 0
+    qualifying_chunks = 0
+
+    for manifest_path in manifests:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("status") != "complete":
+                continue
+            if int(manifest.get("workers_per_node", 0)) != workers:
+                continue
+            chunk_count = int(manifest["chunk_count"])
+            if chunk_count < 1:
+                raise ValueError("invalid chunk count")
+            copied_config = manifest_path.parent / "config.json"
+            if not copied_config.is_file() or _sha256(copied_config) != current_hash:
+                continue
+
+            statuses = []
+            for chunk_id in range(chunk_count):
+                marker = manifest_path.parent / f"shard-{chunk_id}" / "success.json"
+                status = json.loads(marker.read_text(encoding="utf-8"))
+                if (
+                    int(status.get("exit_code", -1)) != 0
+                    or int(status.get("workers", 0)) != workers
+                    or int(status.get("events", 0)) < 1
+                    or int(status.get("elapsed_ns", 0)) < 1
+                ):
+                    raise ValueError("invalid success marker")
+                statuses.append(status)
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            continue
+
+        run_durations = [
+            int(item["elapsed_ns"]) / 1_000_000_000 for item in statuses
+        ]
+        if statistics.median(run_durations) < minimum_chunk_seconds:
+            continue
+
+        total_events += sum(int(item["events"]) for item in statuses)
+        total_elapsed_seconds += sum(run_durations)
+        durations.extend(run_durations)
+        qualifying_runs += 1
+        qualifying_chunks += len(statuses)
+        if qualifying_runs >= max_runs:
+            break
+
+    if not qualifying_runs or total_elapsed_seconds <= 0:
+        return None
+
+    return ThroughputCalibration(
+        events_per_second=total_events / total_elapsed_seconds,
+        run_count=qualifying_runs,
+        chunk_count=qualifying_chunks,
+        median_chunk_seconds=statistics.median(durations),
+        source=f"{qualifying_runs} matching completed run(s)",
     )
 
 
@@ -146,14 +265,15 @@ def recommend_chunks_per_node(
     node_count: int,
     workers: int,
     *,
+    events_per_second: float | None = None,
     target_chunk_seconds: float = RECOMMENDED_CHUNK_SECONDS,
-    max_chunks_per_node: int = MAX_CHUNKS_PER_NODE,
+    max_chunks_per_node: int = MAX_AUTOMATIC_CHUNKS_PER_NODE,
 ) -> int:
     """Recommend queue depth while keeping each chunk long enough to be useful.
 
-    This is a throughput heuristic based on the measured full-XRF benchmark.
-    Different physics or geometry may run at a different rate, so the UI keeps a
-    manual override.
+    A matching long-run measurement should be supplied when available. The
+    conservative fallback avoids exploding a production run into hundreds of
+    startup-dominated chunks. The UI keeps a larger manual override.
     """
     total_events = int(total_events)
     node_count = int(node_count)
@@ -165,9 +285,17 @@ def recommend_chunks_per_node(
     if not math.isfinite(target_chunk_seconds) or target_chunk_seconds <= 0:
         raise ValueError("Target chunk duration must be finite and greater than 0.")
 
+    throughput = (
+        estimate_node_throughput(workers)
+        if events_per_second is None
+        else float(events_per_second)
+    )
+    if not math.isfinite(throughput) or throughput <= 0:
+        raise ValueError("events_per_second must be finite and greater than 0.")
+
     target_events = max(
         1,
-        int(estimate_node_throughput(workers) * target_chunk_seconds),
+        int(throughput * target_chunk_seconds),
     )
     required_chunks = max(1, math.ceil(total_events / target_events))
     chunks_per_node = max(1, math.ceil(required_chunks / node_count))

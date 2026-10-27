@@ -40,6 +40,7 @@ rsync "${RSYNC_OPTIONS[@]}" -e 'ssh -F /dev/null' \
     ./start_tempo_xrf.sh \
     ./deploy_to_mnode.sh \
     ./cluster_jobs/__init__.py \
+    ./cluster_jobs/benchmark_chunks.py \
     ./cluster_jobs/benchmark_workers.py \
     ./cluster_jobs/cluster_config.py \
     ./cluster_jobs/cluster_smoke_test.py \

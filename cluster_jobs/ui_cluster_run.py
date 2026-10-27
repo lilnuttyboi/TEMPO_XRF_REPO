@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,10 @@ def _write_json(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _tail(path: Path, size: int = 4_000) -> str:
     if not path.is_file():
         return f"missing log: {path}"
@@ -74,6 +79,7 @@ def run_cluster(
     label: str | None = None,
 ) -> dict:
     """Run a throttled queue of chunks and return the completed run manifest."""
+    controller_started = time.monotonic()
     config_dir = config_dir.resolve()
     total_events = int(total_events)
     workers = validate_workers(workers)
@@ -112,7 +118,7 @@ def run_cluster(
         partition=partition,
     )
     manifest = {
-        "version": 3,
+        "version": 4,
         "status": "submitting",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "config_dir": str(config_dir),
@@ -129,6 +135,7 @@ def run_cluster(
         "seed_base": seed_base,
         "seed_pairs": [list(pair) for pair in seeds],
         "publish_requested": publish,
+        "config_sha256": _sha256(run_root / "config.json"),
         "sbatch_command": command,
     }
     _write_json(run_root / "run_manifest.json", manifest)
@@ -149,7 +156,9 @@ def run_cluster(
             raise RuntimeError(f"Unexpected sbatch response: {submission.stdout!r}")
         manifest["job_id"] = job_id
         manifest["status"] = "running"
+        manifest["submitted_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         _write_json(run_root / "run_manifest.json", manifest)
+        slurm_wait_started = time.monotonic()
 
         print(f"Submitted Slurm job {job_id}", flush=True)
         print(f"Selected nodes: {','.join(selected_nodes)}", flush=True)
@@ -193,6 +202,9 @@ def run_cluster(
             if not queue.stdout.strip():
                 break
             time.sleep(1)
+        manifest["slurm_queue_and_execution_seconds"] = (
+            time.monotonic() - slurm_wait_started
+        )
 
         # Give close-to-open NFS consistency a short window after Slurm releases
         # the allocation. A failed setup may legitimately produce no marker.
@@ -255,6 +267,7 @@ def run_cluster(
             summary["events"] += int(status["events"])
             summary["elapsed_ns"] += int(status.get("elapsed_ns", 0))
 
+        merge_started = time.monotonic()
         if successful_ids:
             subprocess.run(
                 [
@@ -266,6 +279,7 @@ def run_cluster(
                 ],
                 check=True,
             )
+        manifest["merge_seconds"] = time.monotonic() - merge_started
 
         manifest["successful_shards"] = successful_ids
         manifest["failed_shards"] = failures
@@ -298,6 +312,8 @@ def run_cluster(
             manifest["published_result"] = str(destination)
 
         manifest["status"] = "complete"
+        manifest["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        manifest["controller_elapsed_seconds"] = time.monotonic() - controller_started
         _write_json(run_root / "run_manifest.json", manifest)
 
         print(f"Event {total_events}", flush=True)
@@ -313,6 +329,10 @@ def run_cluster(
                 else "failed"
             )
             manifest["error"] = str(exc)
+            manifest["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            manifest["controller_elapsed_seconds"] = (
+                time.monotonic() - controller_started
+            )
             _write_json(run_root / "run_manifest.json", manifest)
         if job_id:
             subprocess.run(

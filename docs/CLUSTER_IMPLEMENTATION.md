@@ -118,8 +118,10 @@ complete merge is published as the run's simulation.root
 ```
 
 The distributed implementation uses a Slurm job array instead of reserving every
-node in one gang allocation. Automatic queue sizing targets approximately 30
-seconds per chunk using the measured 40/80-worker rates, while Manual mode allows
+node in one gang allocation. Automatic queue sizing targets approximately 60
+seconds per chunk using representative timing learned from matching completed
+runs, and is capped at eight chunks per selected node. Until a matching long run
+exists it uses a conservative production-scale fallback. Manual mode allows
 1--32 chunks per selected node. Concurrent array elements are limited to the
 number of selected nodes. Each array element requests one exclusive node. When a
 fast node completes, Slurm can place another pending chunk there; a slower node
@@ -167,6 +169,13 @@ The UI provides:
   through 32 chunks per selected node. The UI shows the saved event total,
   resulting chunk count, approximate events and estimated duration per chunk,
   and maximum concurrency before submission.
+
+Automatic compares the active run's `config.json` with copied configurations in
+its immutable `cluster_runs` history. It uses up to three recent complete runs
+with the same worker count only when every marker validates and the median chunk
+lasted at least 15 seconds. The event-weighted per-node rate is shown in the UI.
+This prevents startup-dominated smoke tests and old 100,000-event benchmarks from
+driving production queue depth.
 
 ### Event splitting
 
@@ -350,6 +359,14 @@ New repeatable benchmark. It runs 40 and 80 workers on the same exclusive node,
 uses paired seeds, alternates execution order to reduce cache/temperature bias,
 calculates median events per second, and saves every measurement to JSON.
 
+### `cluster_jobs/benchmark_chunks.py`
+
+Production queue-depth benchmark. It runs the same total workload with a
+configurable list such as 1, 2, 4, and 8 chunks per selected node. It alternates
+order across repetitions, does not publish over the current result, measures
+end-to-end controller throughput including merge overhead, retains each run's
+job ID and node distribution, and saves the measured winner to JSON.
+
 ### `cluster_jobs/patch_ui.py`
 
 The old helper formerly encoded five-node assumptions. It no longer modifies
@@ -381,8 +398,9 @@ The Build & run page now:
 - caches inventory for 30 seconds;
 - displays Single node and Distributed modes;
 - allows a configurable node selection instead of a fixed five-node checkbox;
-- defaults to **Automatic (recommended)** queue sizing and retains a 1--32
-  chunks-per-selected-node Manual override;
+- defaults to **Automatic (recommended)** queue sizing, learns from matching
+  representative completed runs, caps Automatic at eight chunks per node, and
+  retains a 1--32 chunks-per-selected-node Manual override;
 - shows the saved event total, calculated chunks, event size, estimated chunk
   duration, and maximum concurrency;
 - defaults distributed selection to every discovered node;
@@ -561,10 +579,9 @@ failure verified the publication safety gate.
 
 The original 14 cluster tests passed on the laptop and in the management virtual
 environment. The dynamic queue raised this to 17 tests, which passed on
-management before and after selective production deployment. Automatic queue
-sizing adds two recommendation tests, bringing the current local suite to 19;
-rerun those 19 on management after selectively deploying the automatic-sizing
-update:
+management before and after selective production deployment. Adaptive queue
+sizing and the queue-depth benchmark bring the current local suite to 22; rerun
+those 22 on management after selectively deploying this update:
 
 ```bash
 cd /srv/cluster/TEMPO_XRF_REPO
@@ -621,7 +638,9 @@ python_code/roboai_xrf_frontend/runs/full_xrf_example/benchmarks/
 
 The 100000-event runs lasted only a few seconds. For a workload-independent
 long-run characterization, repeat the same benchmark with enough events for each
-timed simulation to run for several minutes.
+timed simulation to run for several minutes. The result supports the relative
+80-versus-40 worker choice, but is no longer used as the absolute queue-sizing
+rate because startup dominated those short runs.
 
 ## Starting the frontend
 
@@ -811,6 +830,17 @@ python cluster_jobs/benchmark_workers.py \
   --seed-base 424242
 ```
 
+### Repeatable queue-depth benchmark
+
+```bash
+python cluster_jobs/benchmark_chunks.py \
+  python_code/roboai_xrf_frontend/runs/full_xrf_example \
+  --events 1000000000 \
+  --workers 80 \
+  --chunks 1,2,4,8 \
+  --repetitions 1
+```
+
 ## Current limitations and maintenance notes
 
 - There is no UI page for browsing and reopening historical run folders.
@@ -832,10 +862,11 @@ python cluster_jobs/benchmark_workers.py \
 - The current benchmark clearly favors 80 workers for the tested workload, but
   a longer benchmark is advisable if the event physics or output density changes
   substantially.
-- Automatic chunk sizing is a heuristic based on the measured full-XRF workload.
-  Very small chunks can reduce throughput because every chunk initializes Geant4
-  and creates a ROOT file. Measure representative Automatic, 1, 2, 4, and 8
-  chunk-per-node runs when geometry or physics changes materially.
+- Automatic chunk sizing learns from matching long completed runs, but a changed
+  geometry or physics configuration has no representative history at first.
+  Very small chunks reduce throughput because every chunk initializes Geant4 and
+  creates a ROOT file. Measure representative 1, 2, 4, and 8 chunk-per-node runs
+  with `benchmark_chunks.py` when the workload changes materially.
 - The dynamic job-array path passed clean-checkout and production-checkout Slurm
   smoke tests, including all 20 nodes in job 597 and the production merger in job
   637. A UI-submitted run remains the final frontend-path check.

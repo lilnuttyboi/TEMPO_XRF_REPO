@@ -15,11 +15,13 @@ if str(REPO_PATH) not in sys.path:
     sys.path.append(str(REPO_PATH))
 
 from cluster_jobs.cluster_config import (
+    MAX_AUTOMATIC_CHUNKS_PER_NODE,
     MAX_CHUNKS_PER_NODE,
     RECOMMENDED_CHUNK_SECONDS,
     calculate_queue_shape,
     discover_nodes,
     estimate_node_throughput,
+    load_throughput_calibration,
     recommend_chunks_per_node,
 )
 from components.common import page_header
@@ -47,6 +49,11 @@ def _simulation_is_current() -> bool:
 def _cluster_inventory() -> tuple[tuple[str, ...], str, str | None]:
     inventory = discover_nodes()
     return inventory.nodes, inventory.source, inventory.warning
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _calibrated_throughput(config_dir: str, workers: int):
+    return load_throughput_calibration(Path(config_dir), workers)
 
 
 def _finalize_finished_process() -> None:
@@ -276,6 +283,9 @@ def render_run_page():
         horizontal=True,
         key="cluster_execution_mode",
     )
+    estimated_throughput = estimate_node_throughput(
+        int(run["number_of_thread"])
+    )
     if execution_mode == "Single node":
         selected_nodes = [
             st.selectbox(
@@ -296,11 +306,28 @@ def render_run_page():
                 "more chunks as they become free. The list is refreshed from Slurm."
             ),
         )
+        expected_config_dir = (
+            REPO_PATH
+            / "python_code"
+            / "roboai_xrf_frontend"
+            / "runs"
+            / str(run["run_name"]).strip()
+        ).resolve()
+        calibration = _calibrated_throughput(
+            str(expected_config_dir),
+            int(run["number_of_thread"]),
+        )
+        estimated_throughput = (
+            calibration.events_per_second
+            if calibration is not None
+            else estimate_node_throughput(int(run["number_of_thread"]))
+        )
         recommended_chunks = (
             recommend_chunks_per_node(
                 int(run["beam_on"]),
                 len(selected_nodes),
                 int(run["number_of_thread"]),
+                events_per_second=estimated_throughput,
             )
             if selected_nodes
             else 1
@@ -316,9 +343,21 @@ def render_run_page():
             st.caption(
                 f"Automatic recommendation: {chunks_per_node} chunk(s) per "
                 f"selected node. It targets about "
-                f"{RECOMMENDED_CHUNK_SECONDS:g} seconds per chunk using the "
-                "measured full-XRF cluster rate."
+                f"{RECOMMENDED_CHUNK_SECONDS:g} seconds per chunk and will not "
+                f"automatically exceed {MAX_AUTOMATIC_CHUNKS_PER_NODE}."
             )
+            if calibration is not None:
+                st.caption(
+                    f"Learned rate: {calibration.events_per_second:,.0f} "
+                    f"events/s per node from {calibration.run_count} matching "
+                    f"completed run(s), {calibration.chunk_count} chunks."
+                )
+            else:
+                st.caption(
+                    "No matching long-run timing is available yet; using a "
+                    "conservative production-rate fallback. Manual remains "
+                    "available for a measured override."
+                )
         else:
             chunks_per_node = int(
                 st.number_input(
@@ -353,9 +392,7 @@ def render_run_page():
             if smallest_chunk == largest_chunk
             else f"{smallest_chunk:,}-{largest_chunk:,}"
         )
-        estimated_seconds = largest_chunk / estimate_node_throughput(
-            int(run["number_of_thread"])
-        )
+        estimated_seconds = largest_chunk / estimated_throughput
         st.caption(
             f"Queue for the saved {saved_events:,}-event total: {chunk_count} "
             f"chunks of about {chunk_size} events; up to {max_concurrent} run "

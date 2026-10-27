@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from cluster_jobs.benchmark_chunks import parse_chunk_counts
 from cluster_jobs.cluster_config import (
     DEFAULT_NODES,
     MEMORY_MIB_PER_NODE,
@@ -16,6 +17,7 @@ from cluster_jobs.cluster_config import (
     calculate_queue_shape,
     discover_nodes,
     estimate_node_throughput,
+    load_throughput_calibration,
     parse_node_list,
     recommend_chunks_per_node,
     seed_pairs,
@@ -27,6 +29,11 @@ from cluster_jobs.ui_cluster_run import run_cluster
 
 
 class ClusterConfigTests(unittest.TestCase):
+    def test_chunk_benchmark_list_is_validated_and_deduplicated(self):
+        self.assertEqual(parse_chunk_counts("1,2,4,2,8"), (1, 2, 4, 8))
+        with self.assertRaises(ValueError):
+            parse_chunk_counts("0")
+
     def test_documented_fallback_contains_all_eight_nodes(self):
         self.assertEqual(
             DEFAULT_NODES,
@@ -85,16 +92,82 @@ class ClusterConfigTests(unittest.TestCase):
         self.assertEqual(calculate_queue_shape(803, 8, 4), (32, 8))
         self.assertEqual(calculate_queue_shape(3, 8, 4), (3, 3))
 
-    def test_chunk_recommendation_uses_measured_worker_throughput(self):
-        self.assertAlmostEqual(estimate_node_throughput(40), 22_568.57)
-        self.assertAlmostEqual(estimate_node_throughput(80), 28_557.48)
+    def test_chunk_recommendation_uses_production_scale_fallback(self):
+        self.assertAlmostEqual(estimate_node_throughput(40), 217_000.0)
+        self.assertAlmostEqual(estimate_node_throughput(80), 274_000.0)
         self.assertEqual(recommend_chunks_per_node(10_000_000, 20, 80), 1)
-        self.assertEqual(recommend_chunks_per_node(10_000_000, 4, 80), 3)
-        self.assertEqual(recommend_chunks_per_node(100_000_000, 20, 80), 6)
+        self.assertEqual(recommend_chunks_per_node(100_000_000, 20, 80), 1)
+        self.assertEqual(recommend_chunks_per_node(1_000_000_000, 20, 80), 4)
 
     def test_chunk_recommendation_is_bounded(self):
         self.assertEqual(recommend_chunks_per_node(2, 20, 80), 1)
-        self.assertEqual(recommend_chunks_per_node(10**12, 20, 80), 32)
+        self.assertEqual(recommend_chunks_per_node(10**12, 20, 80), 8)
+
+    def test_chunk_recommendation_accepts_a_learned_rate(self):
+        self.assertEqual(
+            recommend_chunks_per_node(
+                1_000_000_000,
+                20,
+                80,
+                events_per_second=250_000,
+            ),
+            4,
+        )
+
+    def test_calibration_uses_only_matching_representative_complete_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config_dir = Path(temporary) / "compiled"
+            config_dir.mkdir()
+            (config_dir / "config.json").write_text('{"physics":"same"}\n')
+            cluster_runs = config_dir / "cluster_runs"
+
+            def write_run(
+                name,
+                *,
+                config='{"physics":"same"}\n',
+                status="complete",
+                workers=80,
+                elapsed_seconds=20,
+            ):
+                root = cluster_runs / name
+                root.mkdir(parents=True)
+                (root / "config.json").write_text(config)
+                (root / "run_manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "status": status,
+                            "workers_per_node": workers,
+                            "chunk_count": 2,
+                        }
+                    )
+                )
+                for chunk_id in range(2):
+                    shard = root / f"shard-{chunk_id}"
+                    shard.mkdir()
+                    (shard / "success.json").write_text(
+                        json.dumps(
+                            {
+                                "exit_code": 0,
+                                "workers": workers,
+                                "events": 5_000_000,
+                                "elapsed_ns": int(elapsed_seconds * 1e9),
+                            }
+                        )
+                    )
+
+            write_run("valid")
+            write_run("too-short", elapsed_seconds=2)
+            write_run("wrong-config", config='{"physics":"different"}\n')
+            write_run("failed", status="failed")
+            write_run("wrong-workers", workers=40)
+
+            calibration = load_throughput_calibration(config_dir, 80)
+
+        self.assertIsNotNone(calibration)
+        self.assertAlmostEqual(calibration.events_per_second, 250_000.0)
+        self.assertEqual(calibration.run_count, 1)
+        self.assertEqual(calibration.chunk_count, 2)
+        self.assertEqual(calibration.median_chunk_seconds, 20.0)
 
     def test_sbatch_uses_a_throttled_one_node_job_array(self):
         command = build_sbatch_command(
@@ -122,6 +195,7 @@ class LauncherTests(unittest.TestCase):
         self.assertTrue((repo / "tests" / "__init__.py").is_file())
         deployment = (repo / "deploy_to_mnode.sh").read_text(encoding="utf-8")
         self.assertIn("./tests/__init__.py", deployment)
+        self.assertIn("./cluster_jobs/benchmark_chunks.py", deployment)
 
     def test_shared_repo_venv_is_preferred_over_stale_home_copy(self):
         source_script = Path(__file__).parents[1] / "start_tempo_xrf.sh"
